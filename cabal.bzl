@@ -64,6 +64,7 @@ load("@third-party-haskell//:tools.bzl", TOOLS_CABAL_BUCK2_VERSION = "CABAL_BUCK
 load("//buck2:version.bzl", "CABAL_BUCK2_VERSION")
 load("//buck2:cmm.bzl", "cmm_library")
 load("//buck2:cxx.bzl", "cxx_library")
+load("//buck2:headers.bzl", "headers_of")
 load("//buck2:haskell.bzl", "haskell_binary", "haskell_library", "haskell_test")
 load("//cabal-buck2:packages.bzl", "PACKAGES")
 load("@prelude//third-party:pkgconfig.bzl", "external_pkgconfig_library")
@@ -228,7 +229,9 @@ def _cxx_library(c, pkg_dir, pkgconfig_seen):
     # its own (HsFFI.h) and those of the packages the component depends on
     # (HsUnixConfig.h, say).
     packages, _ = _classify_deps(c.get("deps", []))
-    kwargs["deps"] = _nub([_third_party_label(p) for p in ["rts"] + packages]) + [":pkgconfig-" + p for p in pkgconfig]
+    headers = name + "-headers"
+    headers_of(name = headers, deps = _nub([_third_party_label(p) for p in ["rts"] + packages]))
+    kwargs["deps"] = [":" + headers] + [":pkgconfig-" + p for p in pkgconfig]
 
     # cxx_library() adds -std=c++20 to everything, which a C-only target
     # can't have.
