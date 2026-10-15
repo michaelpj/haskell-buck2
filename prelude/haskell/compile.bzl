@@ -225,11 +225,14 @@ def compile_args(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
     compile_args.add(packages_info.exposed_package_args)
     compile_args.add(packages_info.packagedb_args)
 
-    # Add args from preprocess-able inputs.
+    # Add args from preprocess-able inputs: for the C preprocessor of Haskell
+    # code, and for the C that GHC compiles itself (the stubs of foreign
+    # imports, say), which may include the same headers.
     inherited_pre = cxx_inherited_preprocessor_infos(ctx.attrs.deps)
     pre = cxx_merge_cpreprocessors(ctx.actions, [], inherited_pre)
     pre_args = pre.set.project_as_args("args")
     compile_args.add(cmd_args(pre_args, format = "-optP={}"))
+    compile_args.add(cmd_args(pre_args, format = "-optc={}"))
 
     if pkgname:
         compile_args.add(["-this-unit-id", pkgname])
