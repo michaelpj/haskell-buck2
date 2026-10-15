@@ -260,9 +260,9 @@ def _cxx_library(c, pkg_dir, pkgconfig_seen):
     # makes available its own headers (HsFFI.h) and those of the packages
     # the component depends on (HsUnixConfig.h, say).
     kwargs["compiler_flags"] = ["-include", "ghcversion.h"]
-    packages, _ = _classify_deps(c.get("deps", []))
+    packages, labels = _classify_deps(c.get("deps", []))
     headers = name + "-headers"
-    headers_of(name = headers, deps = _nub([_third_party_label(p) for p in ["rts"] + packages]))
+    headers_of(name = headers, deps = _nub([_third_party_label(p) for p in ["rts"] + packages] + labels))
     kwargs["deps"] = [":" + headers] + kwargs["deps"]
 
     # exported_preprocessor_flags is an opaque list of strings to buck2, so
