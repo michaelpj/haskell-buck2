@@ -201,6 +201,10 @@ haskell_library = prelude_rule(
             # Headers in them that GHC includes in the C it generates for what
             # depends on the package (its `includes`).
             "includes": attrs.list(attrs.string(), default = []),
+            # Whether the library's package is exposed: for a GHC that uses
+            # its package database as an installed one (as its global one,
+            # say). The build itself hides all packages.
+            "exposed": attrs.bool(default = False),
             # GHC links the library itself, as it links the libraries of the
             # packages it is told to (the RTS, whose variant it chooses by the
             # way it links): the library's package has these hs-libraries,

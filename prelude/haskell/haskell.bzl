@@ -477,7 +477,7 @@ def _make_package(
         "version: " + (ctx.attrs.package_version or "1.0.0"),
         "id: " + pkgname,
         "key: " + pkgname,
-        "exposed: False",
+        "exposed: " + ("True" if ctx.attrs.exposed else "False"),
         "exposed-modules: " + ", ".join(modules + reexports),
         "import-dirs:" + ", ".join(import_dirs),
         "depends: " + ", ".join([lib.id for lib in hlis]),

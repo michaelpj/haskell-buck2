@@ -37,6 +37,7 @@
 #         "include_dirs": [str], "pkgconfig": [str],
 #         "hsc_options": [str],               # defines for hsc2hs's C compiler (the platform)
 #         "includes": [str],                  # headers that GHC includes in what is compiled against the library
+#         "exposed": bool,                    # False: the library's package isn't exposed (a library's)
 #         "generated_include_dir": str,       # the target of their directory
 #         "generated_headers": str,           # the headers that `./configure` generated: a target in cabal-buck2/autogen
 #         "test_args": [str],                 # test-suites only
@@ -499,6 +500,7 @@ def _haskell_kwargs(c, spec, helpers):
             kwargs["include_dirs"] = include_dirs
         if c.get("includes"):
             kwargs["includes"] = list(c["includes"])
+        kwargs["exposed"] = c.get("exposed", True)
         if c.get("reexports"):
             kwargs["reexported_modules"] = {r["module"]: (_dep_label(project_packages, r["from"]) if "from" in r else None, r["original"]) for r in c["reexports"]}
         exported = _nub(["-l" + l for l in c.get("extra_libraries", [])])
