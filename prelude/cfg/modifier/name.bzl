@@ -31,6 +31,16 @@ NAMED_CONSTRAINT_SETTINGS = {
     "ovr_config//build_mode:arvr_mode": (lambda label: "arvr" if str(label.sub_target[0]) == "enabled" else None),
 }
 
+# A project's own constraint settings to name configurations by, after those
+# above, by the names of their values: `named_constraint_settings` in the
+# `cfg` section of its .buckconfig, a comma-separated list of (fully
+# qualified) labels.
+_PROJECT_NAMED_CONSTRAINT_SETTINGS = [
+    setting.strip()
+    for setting in (read_root_config("cfg", "named_constraint_settings") or "").split(",")
+    if setting.strip()
+]
+
 # Mark all modifier generated configurations with a `cfg:` prefix.
 # We do this so that we can easily recognize which configuration is generated
 # by modifiers and query for it in Scuba.
@@ -42,7 +52,7 @@ def cfg_name(cfg: ConfigurationInfo) -> str:
 
     name_list = []
     constraints = {str(key): value for key, value in cfg.constraints.items()}
-    for constraint_setting, transform in NAMED_CONSTRAINT_SETTINGS.items():
+    for constraint_setting, transform in list(NAMED_CONSTRAINT_SETTINGS.items()) + [(s, None) for s in _PROJECT_NAMED_CONSTRAINT_SETTINGS]:
         constraint_name = None
         if constraint_setting in constraints:
             constraint_value_label = constraints[constraint_setting].label

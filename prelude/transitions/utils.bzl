@@ -6,6 +6,8 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+load("@prelude//cfg/modifier:name.bzl", "cfg_name")
+
 def _filtered_platform_constraints(platform: PlatformInfo, constraint_settings_labels_to_remove: list[TargetLabel]) -> dict[TargetLabel, ConstraintValueInfo]:
     return {
         constraint_setting_label: constraint_setting_value
@@ -27,13 +29,19 @@ def _modify_constraints_transition_impl(ctx: AnalysisContext) -> list[Provider]:
             new_constraints.pop(constraint.setting.label, None)
         for constraint in add:
             new_constraints[constraint.setting.label] = constraint
+        if new_constraints == platform.configuration.constraints:
+            return platform
 
+        configuration = ConfigurationInfo(
+            constraints = new_constraints,
+            values = platform.configuration.values,
+        )
+
+        # Named by its constraints, as the configurations that modifiers make
+        # are, so that it is the same configuration however it is reached.
         return PlatformInfo(
-            label = platform.label,
-            configuration = ConfigurationInfo(
-                constraints = new_constraints,
-                values = platform.configuration.values,
-            ),
+            label = cfg_name(configuration),
+            configuration = configuration,
         )
 
     return [
