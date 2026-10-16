@@ -45,13 +45,18 @@ def _cabal_macros_hsc_flags(cabal_component):
     flags = _cabal_macros_include_flags(cabal_component)
     return ["--cflag=-include", "--cflag=" + flags[1][len("-optP"):]] if flags else []
 
-# Link style for executables: the default is dynamic, opt is static, and prof
-# must also be static - GHC doesn't support prof/dynamic.
+# Link style for executables: the linking constraint's (static or shared), or
+# else dynamic, but static for opt, and for prof, which must be static: GHC
+# doesn't support prof/dynamic.
 _BUILD_MODE_LINK_STYLE = select({
-    "root//buck2/constraints:prof": "static",
+    "root//buck2/constraints:static": "static",
+    "root//buck2/constraints:shared": "shared",
     "DEFAULT": select({
-        "root//buck2/constraints:opt": "static",
-        "DEFAULT": "shared",
+        "root//buck2/constraints:prof": "static",
+        "DEFAULT": select({
+            "root//buck2/constraints:opt": "static",
+            "DEFAULT": "shared",
+        }),
     }),
 })
 
@@ -60,11 +65,18 @@ _BUILD_MODE_HASKELL_FLAGS = select({
     "DEFAULT": [],
 })
 
+# Libraries are built shared when executables are linked shared, and static
+# and shared otherwise (Template Haskell needs a library shared, for a GHC
+# that is itself linked shared).
 _BUILD_MODE_PREFERRED_LINKAGE = select({
-    "root//buck2/constraints:prof": "any",
+    "root//buck2/constraints:static": "any",
+    "root//buck2/constraints:shared": "shared",
     "DEFAULT": select({
-        "root//buck2/constraints:opt": "any",
-        "DEFAULT": "shared",
+        "root//buck2/constraints:prof": "any",
+        "DEFAULT": select({
+            "root//buck2/constraints:opt": "any",
+            "DEFAULT": "shared",
+        }),
     }),
 })
 

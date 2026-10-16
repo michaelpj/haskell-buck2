@@ -44,6 +44,8 @@ def cfg_constructor_if_standalone():
             dev = "root//buck2/constraints:dev",
             opt = "root//buck2/constraints:opt",
             prof = "root//buck2/constraints:prof",
+            static = "root//buck2/constraints:static",
+            shared = "root//buck2/constraints:shared",
         ),
         extra_data = struct(),
     )

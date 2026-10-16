@@ -78,3 +78,23 @@ constraint_value(
     constraint_setting = ":profiling",
     visibility = ["PUBLIC"],
 )
+
+# linking: how executables are linked against their Haskell libraries, when
+# it isn't the build mode's default (shared for dev, static for opt and prof).
+# Profiling can't be linked shared.
+constraint_setting(
+    name = "linking",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "static",
+    constraint_setting = ":linking",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "shared",
+    constraint_setting = ":linking",
+    visibility = ["PUBLIC"],
+)
