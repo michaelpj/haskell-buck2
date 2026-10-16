@@ -658,6 +658,12 @@ def create_merged_link_info(
         swiftmodules = swiftmodules if swiftmodules != None else _EMPTY_SWIFTMODULE_LINKABLE_BY_STRATEGY,
     )
 
+def get_own_link_infos(merged: MergedLinkInfo, link_strategy: LinkStrategy) -> [LinkInfos, None]:
+    """The LinkInfos of the target itself (not its dependencies') that
+    `merged` is the MergedLinkInfo of, for a link strategy."""
+    infos = merged._infos.get(link_strategy)
+    return infos.value if infos != None else None
+
 def create_merged_link_info_for_propagation(ctx: AnalysisContext, xs: list[MergedLinkInfo]) -> MergedLinkInfo:
     """
     Creates a MergedLinkInfo for a node that just propagates up its dependencies' MergedLinkInfo without contributing anything itself.

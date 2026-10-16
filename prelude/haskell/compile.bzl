@@ -21,6 +21,7 @@ load(
 )
 load(
     "@prelude//haskell:util.bzl",
+    "attr_deps",
     "attr_deps_haskell_lib_infos",
     "attr_deps_haskell_link_infos",
     "get_artifact_suffix",
@@ -84,6 +85,7 @@ def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_v
             hidden = [
                 lib.import_dirs.values(),
                 lib.stub_dirs,
+                lib.include_dirs,
                 # libs of dependencies might be needed at compile time if
                 # we're using Template Haskell:
                 lib.libs,
@@ -228,7 +230,7 @@ def compile_args(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
     # Add args from preprocess-able inputs: for the C preprocessor of Haskell
     # code, and for the C that GHC compiles itself (the stubs of foreign
     # imports, say), which may include the same headers.
-    inherited_pre = cxx_inherited_preprocessor_infos(ctx.attrs.deps)
+    inherited_pre = cxx_inherited_preprocessor_infos(attr_deps(ctx))
     pre = cxx_merge_cpreprocessors(ctx.actions, [], inherited_pre)
     pre_args = pre.set.project_as_args("args")
     compile_args.add(cmd_args(pre_args, format = "-optP={}"))

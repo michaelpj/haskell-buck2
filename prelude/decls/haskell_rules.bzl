@@ -185,6 +185,36 @@ haskell_library = prelude_rule(
             "ghci_platform_preload_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = True)), default = []),
             "ghci_preload_deps": attrs.set(attrs.dep(), sorted = True, default = []),
             "haddock_flags": attrs.list(attrs.arg(), default = []),
+            # The include directories of the library's package (its
+            # `include-dirs`): GHC gives them to the C preprocessor and C
+            # compiler for what depends on the package, and finds the
+            # platform constants in those of the rts.
+            "include_dirs": attrs.list(attrs.source(allow_directory = True), default = []),
+            # Libraries that are part of this one, as the C of a Cabal package
+            # is part of its library: their objects are in its archive, and
+            # linked into its shared library, and what depends on it isn't
+            # linked with them again (nor with their own dependencies, which
+            # the library should depend on). They should have static
+            # preferred linkage, and their link info be objects
+            # (use_archive = False, for a cxx_library).
+            "internal_deps": attrs.list(attrs.dep(), default = []),
+            # Headers in them that GHC includes in the C it generates for what
+            # depends on the package (its `includes`).
+            "includes": attrs.list(attrs.string(), default = []),
+            # GHC links the library itself, as it links the libraries of the
+            # packages it is told to (the RTS, whose variant it chooses by the
+            # way it links): the library's package has these hs-libraries,
+            # which GHC finds in library_dir, named as GHC names them, for
+            # every way of linking. Its own library files aren't linked (nor
+            # built); library_dir's shared libraries are those of what is
+            # linked with it.
+            "hs_libraries": attrs.list(attrs.string(), default = []),
+            "library_dir": attrs.option(attrs.dep(), default = None),
+            # The names of the library's files (lib<name>.a, lib<name>_p.a
+            # profiled, lib<name>.so and its soname), instead of names from
+            # its label: those that GHC would look for (for library_dir).
+            "static_library_name": attrs.option(attrs.string(), default = None),
+            "shared_library_name": attrs.option(attrs.string(), default = None),
             "linker_flags": attrs.list(attrs.arg(), default = []),
             # The name the library's package has in the package db, for
             # `import "name" Module`. Not its id, which is derived from the
@@ -195,6 +225,10 @@ haskell_library = prelude_rule(
             # the dependency and the module's original name (the
             # `reexported-modules` of a Cabal package).
             "reexported_modules": attrs.dict(attrs.string(), attrs.tuple(attrs.option(attrs.dep()), attrs.string()), default = {}),
+            # The library's unit id, when it must be a particular one (that of
+            # a package GHC knows by its unit id, say: rts, ghc-internal).
+            # Otherwise it is derived from the label.
+            "unit_id": attrs.option(attrs.string(), default = None),
             # Its version, which GHC defines `VERSION_<package>` macros with:
             # they must agree with the ones of the package's cabal_macros.h.
             "package_version": attrs.option(attrs.string(), default = None),

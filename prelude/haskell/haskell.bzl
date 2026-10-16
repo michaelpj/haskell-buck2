@@ -57,6 +57,7 @@ load(
     "@prelude//haskell:compile.bzl",
     "CompileResultInfo",
     "compile",
+    "get_packages_info",
 )
 load(
     "@prelude//haskell:haskell_haddock.bzl",
@@ -84,7 +85,6 @@ load(
     "attr_deps",
     "attr_deps_haskell_link_infos_sans_template_deps",
     "attr_deps_merged_link_infos",
-    "attr_deps_profiling_link_infos",
     "attr_deps_shared_library_infos",
     "get_artifact_suffix",
     "haskell_library_name",
@@ -119,6 +119,7 @@ load(
     "get_lib_output_style",
     "get_link_args_for_strategy",
     "get_output_styles_for_linkage",
+    "get_own_link_infos",
     "legacy_output_style_to_link_style",
     "to_link_strategy",
     "unpack_link_args",
@@ -479,15 +480,36 @@ def _make_package(
         "exposed: False",
         "exposed-modules: " + ", ".join(modules + reexports),
         "import-dirs:" + ", ".join(import_dirs),
-        "library-dirs:" + ", ".join(library_dirs),
-        "extra-libraries: " + libname,
         "depends: " + ", ".join([lib.id for lib in hlis]),
     ]
-    if own_shared_lib != None:
-        conf.append('dynamic-library-dirs:"${pkgroot}/lib-shared"')
-    pkg_conf = ctx.actions.write("pkg-" + artifact_suffix + ".conf", conf, has_content_based_path = False)
 
     db = ctx.actions.declare_output("db-" + artifact_suffix, has_content_based_path = False)
+
+    ghc_library_dir = _ghc_library_dir(ctx)
+    if ghc_library_dir:
+        ghc_library_dir_arg = cmd_args(ghc_library_dir, relative_to = (db, 1), format = '"${pkgroot}/{}"')
+        conf.append(cmd_args("library-dirs: ", ghc_library_dir_arg, delimiter = ""))
+        conf.append(cmd_args("dynamic-library-dirs: ", ghc_library_dir_arg, delimiter = ""))
+        conf.append("hs-libraries: " + ", ".join(ctx.attrs.hs_libraries))
+    else:
+        conf.append("library-dirs:" + ", ".join(library_dirs))
+        conf.append("extra-libraries: " + libname)
+        if own_shared_lib != None:
+            conf.append('dynamic-library-dirs:"${pkgroot}/lib-shared"')
+
+    include_dirs = ctx.attrs.include_dirs
+    if include_dirs:
+        conf.append(cmd_args(
+            "include-dirs: ",
+            cmd_args(
+                [cmd_args(d, relative_to = (db, 1), format = '"${pkgroot}/{}"') for d in include_dirs],
+                delimiter = ", ",
+            ),
+            delimiter = "",
+        ))
+    if ctx.attrs.includes:
+        conf.append("includes: " + ", ".join(ctx.attrs.includes))
+    pkg_conf, _ = ctx.actions.write("pkg-" + artifact_suffix + ".conf", conf, has_content_based_path = False, allow_args = True)
 
     # While the list of hlis is unique, there may be multiple packages in the same db.
     # Cutting down the GHC_PACKAGE_PATH significantly speeds up GHC.
@@ -524,8 +546,9 @@ def _make_package(
                 use_cache_arg,
                 haskell_toolchain.packager,
             ],
-            # needs hi, because ghc-pkg checks that the .hi files exist
-            hidden = hi.values() + lib.values() + ([own_shared_lib] if own_shared_lib != None else []),
+            # needs hi, because ghc-pkg checks that the .hi files exist (and
+            # the include dirs)
+            hidden = hi.values() + ([ghc_library_dir] if ghc_library_dir else lib.values()) + include_dirs + ([own_shared_lib] if own_shared_lib != None else []),
         ),
         category = "haskell_package_" + artifact_suffix.replace("-", "_"),
         env = {"GHC_PACKAGE_PATH": ghc_package_path} if db_deps else {},
@@ -692,9 +715,7 @@ def _build_haskell_lib(
     solibs = {}
     artifact_suffix = get_artifact_suffix(link_style, enable_profiling)
 
-    libstem = libname
-    if link_style == LinkStyle("static_pic"):
-        libstem += "_pic"
+    libstem = _library_stem(ctx, libname, link_style)
 
     dynamic_lib_suffix = "." + LINKERS[linker_info.type].default_shared_library_extension
     static_lib_suffix = "_p.a" if enable_profiling else ".a"
@@ -729,7 +750,7 @@ def _build_haskell_lib(
         # TODO: avoid making an archive for a single object, like cxx does
         # (but would that work with Template Haskell?)
         # TODO: Opt haskell actions into content based paths.
-        archive = make_archive(ctx, lib_short_path, objfiles, force_disable_content_based_path = True)
+        archive = make_archive(ctx, lib_short_path, objfiles + _internal_objects(ctx, link_style), force_disable_content_based_path = True)
         lib = archive.artifact
         libs = [lib] + (archive.external_objects if archive.archive_contents_type == ArchiveContentsType("thin") else [])
         link_infos = LinkInfos(
@@ -807,7 +828,7 @@ def _build_haskell_lib(
         ctx.actions.symlink_file(own_shared_lib.as_output(), non_profiling_shared_lib)
     shared_output = None
     if dynamic_too:
-        shared_libfile = "lib" + libname + dynamic_lib_suffix
+        shared_libfile = "lib" + _library_stem(ctx, libname, LinkStyle("shared")) + dynamic_lib_suffix
         shared_lib_short_path = paths.join("lib-shared", shared_libfile)
         dyn_objfiles = _srcs_to_objfiles(ctx, compiled.objects, "dyn_o")
         shared_lib, shared_solib, shared_link_infos = _link_haskell_shared_lib(
@@ -847,7 +868,9 @@ def _build_haskell_lib(
             id = pkgname,
             import_dirs = {False: compiled.hi},
             stub_dirs = [compiled.stubs],
-            libs = [shared_lib],
+            include_dirs = ctx.attrs.include_dirs,
+            libs = _library_infos_libs(ctx, [shared_lib]),
+            linked_by_ghc = bool(ctx.attrs.hs_libraries),
             version = ctx.attrs.package_version or "1.0.0",
             is_prebuilt = False,
             profiling_enabled = False,
@@ -879,7 +902,9 @@ def _build_haskell_lib(
         id = pkgname,
         import_dirs = import_artifacts,
         stub_dirs = stub_dirs,
-        libs = all_libs,
+        include_dirs = ctx.attrs.include_dirs,
+        libs = _library_infos_libs(ctx, all_libs),
+        linked_by_ghc = bool(ctx.attrs.hs_libraries),
         version = ctx.attrs.package_version or "1.0.0",
         is_prebuilt = False,
         profiling_enabled = enable_profiling,
@@ -895,6 +920,60 @@ def _build_haskell_lib(
 
     return (main_output, shared_output)
 
+def _library_stem(ctx: AnalysisContext, libname: str, link_style: LinkStyle) -> str:
+    # The name of the library's file for a link style, between "lib" and the
+    # extension (and "_p", when profiled).
+    if link_style == LinkStyle("static_pic"):
+        return libname + "_pic"
+    if link_style == LinkStyle("static") and ctx.attrs.static_library_name:
+        return ctx.attrs.static_library_name
+    if link_style == LinkStyle("shared") and ctx.attrs.shared_library_name:
+        return ctx.attrs.shared_library_name
+    return libname
+
+def _ghc_library_dir(ctx: AnalysisContext) -> [Artifact, None]:
+    # The directory of the library's files when GHC links it (hs_libraries).
+    if not ctx.attrs.hs_libraries:
+        return None
+    if ctx.attrs.library_dir == None:
+        fail("{}: hs_libraries without a library_dir to find them in".format(ctx.label))
+    return ctx.attrs.library_dir[DefaultInfo].default_outputs[0]
+
+def _library_infos_libs(ctx: AnalysisContext, libs: list[Artifact]) -> list[Artifact]:
+    # What a library gives what depends on it of its library files: those it
+    # is linked with (when GHC links it, those it chooses from).
+    ghc_library_dir = _ghc_library_dir(ctx)
+    return [ghc_library_dir] if ghc_library_dir else libs
+
+def _linked_infos(ctx: AnalysisContext, infos: LinkInfos) -> LinkInfos:
+    # What is linked of the library: nothing of its own when GHC links it
+    # (hs_libraries), but what it needs linked with it.
+    if not ctx.attrs.hs_libraries:
+        return infos
+    return LinkInfos(default = LinkInfo(name = infos.default.name, pre_flags = ctx.attrs.exported_linker_flags))
+
+def _internal_objects(ctx: AnalysisContext, link_style: LinkStyle) -> list[Artifact]:
+    # The objects of the library's internal_deps, which its archive has in
+    # it as well as its own.
+    objects = []
+    for dep in ctx.attrs.internal_deps:
+        infos = get_own_link_infos(dep[MergedLinkInfo], to_link_strategy(link_style))
+        if infos == None:
+            fail("{}: internal dependency {} has nothing to link for {} linking".format(ctx.label, dep.label, link_style.value))
+        for linkable in infos.default.linkables:
+            if not hasattr(linkable, "objects"):
+                fail("{}: internal dependency {} isn't objects, which the library's archive can include (use_archive = False, for a cxx_library)".format(ctx.label, dep.label))
+            objects.extend(linkable.objects)
+    return objects
+
+def _exported_link_infos(ctx: AnalysisContext, enable_profiling: bool) -> list[MergedLinkInfo]:
+    # The link infos of the library's dependencies, but not of its
+    # internal_deps.
+    return filter(None, [
+        (d.get(HaskellProfLinkInfo).prof_infos if enable_profiling and d.get(HaskellProfLinkInfo) else d.get(MergedLinkInfo))
+        for d in ctx.attrs.deps
+    ])
+
 def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
     preferred_linkage = _attr_preferred_linkage(ctx)
     if ctx.attrs.enable_profiling and preferred_linkage == Linkage("any"):
@@ -903,7 +982,6 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
     # Get haskell and native link infos from all deps
     hlis = attr_deps_haskell_link_infos_sans_template_deps(ctx)
     nlis = attr_deps_merged_link_infos(ctx)
-    prof_nlis = attr_deps_profiling_link_infos(ctx)
     shared_library_infos = attr_deps_shared_library_infos(ctx)
 
     solibs = {}
@@ -917,7 +995,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
     sub_targets = {}
 
     libname = haskell_library_name(ctx.label)
-    pkgname = haskell_library_unit_id(ctx.label)
+    pkgname = ctx.attrs.unit_id or haskell_library_unit_id(ctx.label)
 
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
     native_shared_libs_dir = (
@@ -980,6 +1058,13 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
             sub_targets[link_style.value.replace("_", "-")] = [
                 DefaultInfo(
                     default_outputs = libs,
+                )
+            ]
+
+            # useful for debugging, to see the package DB(s)
+            sub_targets["db-" + link_style.value.replace("_", "-")] =  [
+                DefaultInfo(
+                    default_outputs = [hlib.db],
                 )
             ]
 
@@ -1053,21 +1138,24 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
         prof_link_infos[LinkStyle("shared")] = link_infos[LinkStyle("shared")]
 
     default_link_infos = prof_link_infos if ctx.attrs.enable_profiling else link_infos
-    default_native_infos = prof_nlis if ctx.attrs.enable_profiling else nlis
     merged_link_info = create_merged_link_info(
         ctx,
         pic_behavior = pic_behavior,
-        link_infos = {_to_lib_output_style(s): v for s, v in default_link_infos.items()},
+        link_infos = {_to_lib_output_style(s): _linked_infos(ctx, v) for s, v in default_link_infos.items()},
         preferred_linkage = preferred_linkage,
-        exported_deps = default_native_infos,
+        # Haskell code may refer to the code of any library below it (through
+        # inlining), so the libraries it depends on are linked with it, but
+        # not those that are part of it (its internal_deps, in its archive or
+        # linked into its shared library).
+        exported_deps = _exported_link_infos(ctx, enable_profiling = ctx.attrs.enable_profiling),
     )
 
     prof_merged_link_info = create_merged_link_info(
         ctx,
         pic_behavior = pic_behavior,
-        link_infos = {_to_lib_output_style(s): v for s, v in prof_link_infos.items()},
+        link_infos = {_to_lib_output_style(s): _linked_infos(ctx, v) for s, v in prof_link_infos.items()},
         preferred_linkage = preferred_linkage,
-        exported_deps = prof_nlis,
+        exported_deps = _exported_link_infos(ctx, enable_profiling = True),
     )
 
     linkable_graph = create_linkable_graph(
@@ -1078,7 +1166,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 ctx = ctx,
                 preferred_linkage = preferred_linkage,
                 exported_deps = ctx.attrs.deps,
-                link_infos = {_to_lib_output_style(s): v for s, v in link_infos.items()},
+                link_infos = {_to_lib_output_style(s): _linked_infos(ctx, v) for s, v in link_infos.items()},
                 shared_libs = shared_libs,
                 # TODO(cjhopman): this should be set to non-None
                 default_soname = None,
@@ -1124,8 +1212,8 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
         cxx_merge_cpreprocessors(ctx.actions, pp, inherited_pp_info),
         merge_shared_libraries(
             ctx.actions,
-            shared_libs,
-            shared_library_infos,
+            None if ctx.attrs.hs_libraries else shared_libs,
+            shared_library_infos + ([ctx.attrs.library_dir[SharedLibraryInfo]] if ctx.attrs.hs_libraries else []),
         ),
         haskell_haddock_lib(ctx, pkgname),
     ]
@@ -1228,7 +1316,23 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     if enable_profiling:
         link.add("-prof")
 
+    # For the libraries that GHC links itself (the rts), which it chooses by
+    # the way it links.
+    if link_style == LinkStyle("shared"):
+        link.add("-dynamic")
+
     link_args = cmd_args("-package-env=-")
+
+    # GHC links some packages itself, which it finds in the package
+    # databases of the dependencies: those it links by default (the rts and
+    # base, of the compiler when they aren't built here), or otherwise those
+    # it is to link (hs_libraries), when everything else comes from here.
+    packages_info = get_packages_info(ctx, link_style, specify_pkg_version = False, enable_profiling = enable_profiling)
+    link_args.add(packages_info.packagedb_args)
+    linked_by_ghc = [lib.id for lib in packages_info.transitive_deps.traverse() if lib.linked_by_ghc]
+    if linked_by_ghc:
+        link_args.add("-no-auto-link-packages")
+        link_args.add([cmd_args("-package-id", id) for id in linked_by_ghc])
 
     osuf, _hisuf = output_extensions(link_style, enable_profiling)
 

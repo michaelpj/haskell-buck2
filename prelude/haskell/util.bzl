@@ -78,7 +78,9 @@ def module_name_to_file(x: str, ext: str) -> str:
     return x.replace(".", "/") + "." + ext
 
 def attr_deps(ctx: AnalysisContext) -> list[Dependency]:
-    return ctx.attrs.deps
+    # A library's internal_deps are dependencies like the others, except in
+    # what it passes on to be linked with it.
+    return ctx.attrs.deps + (getattr(ctx.attrs, "internal_deps", None) or [])
 
 def attr_deps_haskell_link_infos(ctx: AnalysisContext) -> list[HaskellLinkInfo]:
     return dedupe(
@@ -105,24 +107,27 @@ def attr_deps_haskell_lib_infos(ctx: AnalysisContext, link_style: LinkStyle, ena
         for x in filter(None, [d.get(HaskellLibraryProvider) for d in attr_deps(ctx) + ctx.attrs.template_deps])
     ]
 
-def attr_deps_merged_link_infos(ctx: AnalysisContext) -> list[MergedLinkInfo]:
+# The *_link_infos and *_library_infos functions are of `deps`, if given,
+# instead of all the deps.
+
+def attr_deps_merged_link_infos(ctx: AnalysisContext, deps: [list[Dependency], None] = None) -> list[MergedLinkInfo]:
     return dedupe(
         filter(
             None,
-            [d.get(MergedLinkInfo) for d in attr_deps(ctx)],
+            [d.get(MergedLinkInfo) for d in (attr_deps(ctx) if deps == None else deps)],
         )
     )
 
-def attr_deps_profiling_link_infos(ctx: AnalysisContext) -> list[MergedLinkInfo]:
+def attr_deps_profiling_link_infos(ctx: AnalysisContext, deps: [list[Dependency], None] = None) -> list[MergedLinkInfo]:
     return filter(
         None,
-        [d.get(HaskellProfLinkInfo).prof_infos if d.get(HaskellProfLinkInfo) else d.get(MergedLinkInfo) for d in attr_deps(ctx)],
+        [d.get(HaskellProfLinkInfo).prof_infos if d.get(HaskellProfLinkInfo) else d.get(MergedLinkInfo) for d in (attr_deps(ctx) if deps == None else deps)],
     )
 
-def attr_deps_shared_library_infos(ctx: AnalysisContext) -> list[SharedLibraryInfo]:
+def attr_deps_shared_library_infos(ctx: AnalysisContext, deps: [list[Dependency], None] = None) -> list[SharedLibraryInfo]:
     return filter(
         None,
-        [d.get(SharedLibraryInfo) for d in attr_deps(ctx)],
+        [d.get(SharedLibraryInfo) for d in (attr_deps(ctx) if deps == None else deps)],
     )
 
 def _link_style_extensions(link_style: LinkStyle) -> (str, str):
