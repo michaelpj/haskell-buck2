@@ -87,6 +87,16 @@ def system_demo_toolchains():
         visibility = ["PUBLIC"],
     )
 
+    # The C++ toolchain's default names this in an arm of a select() that is
+    # never chosen (see _cxx_toolchain() in decls/toolchains_common.bzl), so
+    # it only has to exist: for queries of the unconfigured graph (uquery),
+    # which follow every arm.
+    android_hack_alias(
+        name = "cxx_no_default_deps",
+        actual = ":cxx",
+        visibility = ["PUBLIC"],
+    )
+
     system_dex_toolchain(
         name = "dex",
         android_sdk_tools_target = ":android_sdk_tools",
