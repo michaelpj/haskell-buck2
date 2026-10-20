@@ -364,6 +364,11 @@ def _haskell_kwargs(c, spec, cxx_deps):
         exported = _nub(["-l" + l for l in c.get("extra_libraries", [])])
         if exported:
             kwargs["exported_linker_flags"] = exported
+            # The library's own shared object must link against them too,
+            # not only whatever finally links the library in: GHC loads the
+            # .so to run Template Haskell splices in dependents, and that
+            # fails on any symbol it leaves unresolved.
+            kwargs["linker_flags"] = exported
     else:
         linker_flags = _linker_flags(c, project_ghc_options)
         if linker_flags:
