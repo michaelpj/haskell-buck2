@@ -1,7 +1,6 @@
-load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
-load(":defaults.bzl", "default_haskell_toolchain")
+load(":defaults.bzl", "default_haskell_toolchain", "default_toolchains")
 
 # Defaults for other toolchains
-system_demo_toolchains()
+default_toolchains()
 
 default_haskell_toolchain(name = "haskell")

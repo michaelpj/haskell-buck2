@@ -218,9 +218,9 @@ def _build_tool_depends(build_tools):
             labels.append(_third_party_label(t["exe"] + "-exe"))
     return _nub(labels)
 
-def _cxx_kwargs(c, pkgconfig_seen, srcs, cxx):
+def _cxx_kwargs(c, pkgconfig_seen, srcs):
     # The attributes of a C/C++ rule that compiles `srcs` with the
-    # component's options; `cxx` says whether there is C++ among them.
+    # component's options.
     pkgconfig = _nub(c.get("pkgconfig", []))
     for p in pkgconfig:
         if p not in pkgconfig_seen:
@@ -241,10 +241,6 @@ def _cxx_kwargs(c, pkgconfig_seen, srcs, cxx):
 
     kwargs["deps"] = [":pkgconfig-" + p for p in pkgconfig]
 
-    # cxx_library() and cxx_binary() add -std=c++20 to everything, which a
-    # C-only target can't have.
-    if not cxx:
-        kwargs["cxx_std"] = False
     return kwargs
 
 def _cxx_library(c, pkg_dir, pkgconfig_seen):
@@ -252,7 +248,7 @@ def _cxx_library(c, pkg_dir, pkgconfig_seen):
     srcs = list(c.get("c_sources", [])) + list(c.get("cxx_sources", [])) + list(c.get("asm_sources", []))
     if not srcs:
         return []
-    kwargs = _cxx_kwargs(c, pkgconfig_seen, srcs, bool(c.get("cxx_sources")))
+    kwargs = _cxx_kwargs(c, pkgconfig_seen, srcs)
     name = c["name"] + "-cxx"
 
     # The C of a Haskell component is compiled as GHC would compile it,
@@ -306,8 +302,7 @@ def _cxx_binary(c, pkg_dir, pkgconfig_seen, overrides):
             " or ".join(unsupported),
         ))
     srcs = [c["main_is"]] + list(c.get("c_sources", [])) + list(c.get("cxx_sources", [])) + list(c.get("asm_sources", []))
-    cxx = bool(c.get("cxx_sources")) or paths.split_extension(c["main_is"])[1] != ".c"
-    kwargs = _cxx_kwargs(c, pkgconfig_seen, srcs, cxx)
+    kwargs = _cxx_kwargs(c, pkgconfig_seen, srcs)
     kwargs["name"] = c["name"]
     if "exe_name" in c:
         kwargs["executable_name"] = c["exe_name"]

@@ -24,7 +24,8 @@ def _hsc2hs_impl(ctx: AnalysisContext) -> list[Provider]:
     # C++ code. A package that is only C (Cabal's way) must not be compiled as
     # C++, which doesn't accept what hsc2hs generates for #alignment.
     cxx_toolchain = get_cxx_toolchain_info(ctx)
-    compiler = cxx_toolchain.cxx_compiler_info.compiler if ctx.attrs.cxx else cxx_toolchain.c_compiler_info.compiler
+    compiler_info = cxx_toolchain.cxx_compiler_info if ctx.attrs.cxx else cxx_toolchain.c_compiler_info
+    compiler = compiler_info.compiler
 
     # hsc2hs wants a single program, but the compiler is a command (with the
     # cache, it is `env` setting a fingerprint, then the compiler).
@@ -33,7 +34,8 @@ def _hsc2hs_impl(ctx: AnalysisContext) -> list[Provider]:
     cmd = cmd_args(
         hsc2hs_tool,
         cmd_args("--cc=", cmd_args(cc, hidden = cc_hidden), delimiter = ""),
-        ["-C", "-std=c++20"] if ctx.attrs.cxx else [],
+        # The project's flags for the language (see default_toolchains()).
+        cmd_args(compiler_info.compiler_flags, format = "--cflag={}"),
         "-C",
         "-D__HSC2HS__=1",
         ctx.attrs.extra_flags,

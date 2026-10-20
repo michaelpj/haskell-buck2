@@ -1,4 +1,9 @@
 load("@third-party-haskell//:tools.bzl", "CC_FINGERPRINT", "GHC_DYNAMIC", "GHC_FINGERPRINT", "GHC_VERSION")
+load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
+load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain")
+load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load(":haskell.bzl", "haskell_toolchain")
 
 # The GHC that `cabal buck2` configured the project with.
@@ -85,3 +90,46 @@ def default_haskell_toolchain(name, **kwargs):
     kwargs.setdefault("link_env", {"CABAL_BUCK2_GHC": GHC_FINGERPRINT, "CABAL_BUCK2_CC": CC_FINGERPRINT})
     kwargs.setdefault("visibility", ["PUBLIC"])
     haskell_toolchain(name = name, **kwargs)
+
+# The toolchains besides Haskell's that the rules of a project set up by
+# `cabal buck2` use. The project's C and C++ compiler flags (`c_flags`,
+# `cxx_flags`: e.g. its language standard and target CPU) are the C/C++
+# toolchain's.
+def default_toolchains(c_flags = [], cxx_flags = []):
+    system_cxx_toolchain(
+        name = "cxx",
+        c_flags = c_flags,
+        cxx_flags = cxx_flags,
+        linker = "g++",
+        visibility = ["PUBLIC"],
+    )
+
+    # The C++ toolchain's default names this in an arm of a select() that is
+    # never chosen (see _cxx_toolchain() in decls/toolchains_common.bzl), so
+    # it only has to exist: for queries of the unconfigured graph (uquery),
+    # which follow every arm.
+    native.alias(
+        name = "cxx_no_default_deps",
+        actual = ":cxx",
+        visibility = ["PUBLIC"],
+    )
+
+    system_genrule_toolchain(
+        name = "genrule",
+        visibility = ["PUBLIC"],
+    )
+
+    system_python_bootstrap_toolchain(
+        name = "python_bootstrap",
+        visibility = ["PUBLIC"],
+    )
+
+    remote_test_execution_toolchain(
+        name = "remote_test_execution",
+        visibility = ["PUBLIC"],
+    )
+
+    noop_test_toolchain(
+        name = "test",
+        visibility = ["PUBLIC"],
+    )
