@@ -1,0 +1,12 @@
+load("//buck2:haskell.bzl", "haskell_library")
+
+# Re-exports a's A.Base, which ux imports through it.
+haskell_library(
+    name = "rx",
+    srcs = {"R.R": "R/R.hs"},
+    packages = ["base"],
+    deps = ["//a:a"],
+    reexported_modules = {"A.Base": ("//a:a", "A.Base")},
+    per_module = True,
+    visibility = ["PUBLIC"],
+)

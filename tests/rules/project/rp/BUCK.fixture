@@ -1,0 +1,15 @@
+load("//buck2:haskell.bzl", "haskell_library")
+
+# Flat sources: Lib imports User, which imports Q.Lib from //mk:mk. Lib is
+# not Q.Lib, though Q.Lib's interface path ends in /Lib.hi.
+haskell_library(
+    name = "rp",
+    srcs = {
+        "Lib": "Lib.hs",
+        "User": "User.hs",
+    },
+    packages = ["base"],
+    deps = ["//mk:mk"],
+    per_module = True,
+    visibility = ["PUBLIC"],
+)

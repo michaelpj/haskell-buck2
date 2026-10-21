@@ -1,0 +1,13 @@
+load("//buck2:haskell.bzl", "haskell_library")
+
+# A splice that runs //a:a's code, in a module without a LANGUAGE pragma:
+# it runs Template Haskell only where the toolchain's flags enable it, as
+# check_toolchain_th has them.
+haskell_library(
+    name = "tf",
+    srcs = {"TF.M": "TF/M.hs"},
+    packages = ["base", "template-haskell"],
+    deps = ["//a:a"],
+    per_module = True,
+    visibility = ["PUBLIC"],
+)

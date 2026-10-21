@@ -1,0 +1,12 @@
+load("//buck2:haskell.bzl", "haskell_library")
+
+# Depends on th, but its splice runs only template-haskell's code.
+haskell_library(
+    name = "d",
+    srcs = {"D.Splice": "D/Splice.hs"},
+    packages = ["base", "template-haskell"],
+    deps = ["//a:a", "//th:th"],
+    th_build_depends = [],
+    per_module = True,
+    visibility = ["PUBLIC"],
+)

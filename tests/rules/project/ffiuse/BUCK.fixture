@@ -1,0 +1,20 @@
+load("//buck2:haskell.bzl", "haskell_binary", "haskell_library")
+
+# A splice that calls //cl:cl's C function, through //ffi:ffi.
+haskell_library(
+    name = "ffiuse",
+    srcs = {"U.V": "U/V.hs"},
+    packages = ["base", "template-haskell"],
+    deps = ["//ffi:ffi"],
+    per_module = True,
+    visibility = ["PUBLIC"],
+)
+
+# Prints U.V's splice, to see that it follows //cl:cl.
+haskell_binary(
+    name = "show",
+    srcs = {"Main": "Show.hs"},
+    packages = ["base"],
+    deps = [":ffiuse"],
+    per_module = True,
+)

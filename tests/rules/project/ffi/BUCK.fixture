@@ -1,0 +1,11 @@
+load("//buck2:haskell.bzl", "haskell_library")
+
+# Imports cl_value from //cl:cl.
+haskell_library(
+    name = "ffi",
+    srcs = {"FFI.C": "FFI/C.hs"},
+    packages = ["base"],
+    deps = ["//cl:cl"],
+    per_module = True,
+    visibility = ["PUBLIC"],
+)

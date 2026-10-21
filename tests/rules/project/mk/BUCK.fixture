@@ -1,0 +1,11 @@
+load("//buck2:haskell.bzl", "haskell_library")
+
+# Compiled with --make, so Q.Lib's interface is .../Q/Lib.hi, a path that
+# ends as //rp:rp's flat module Lib's would. The rules must not take it for
+# Lib's (see _read_deps_makefile); if they do, rp fails to build.
+haskell_library(
+    name = "mk",
+    srcs = {"Q.Lib": "Q/Lib.hs"},
+    packages = ["base"],
+    visibility = ["PUBLIC"],
+)

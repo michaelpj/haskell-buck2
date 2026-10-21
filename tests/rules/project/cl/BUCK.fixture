@@ -1,0 +1,7 @@
+# A C library, linked shared, whose function //ffi:ffi imports.
+cxx_library(
+    name = "cl",
+    srcs = ["cl.c"],
+    preferred_linkage = "shared",
+    visibility = ["PUBLIC"],
+)
