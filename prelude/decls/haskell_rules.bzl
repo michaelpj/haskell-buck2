@@ -59,6 +59,7 @@ haskell_binary = prelude_rule(
             "ghci_platform_preload_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = True)), default = []),
             "ghci_preload_deps": attrs.set(attrs.dep(), sorted = True, default = []),
             "link_deps_query_whole": attrs.bool(default = False),
+            "per_module": attrs.bool(default = False),  # as haskell_library's
             "linker_flags": attrs.list(attrs.arg(), default = []),
             "platform": attrs.option(attrs.string(), default = None),
         }
@@ -185,6 +186,13 @@ haskell_library = prelude_rule(
             "ghci_platform_preload_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = True)), default = []),
             "ghci_preload_deps": attrs.set(attrs.dep(), sorted = True, default = []),
             "haddock_flags": attrs.list(attrs.arg(), default = []),
+            # Experimental. Compile each module in an action of its own (ghc -c, from a
+            # module graph that a ghc -M action computes) rather than the
+            # whole target in one ghc --make: buck2 then schedules the
+            # modules in parallel and rebuilds only those whose imports'
+            # interfaces changed. See _compile_per_module in
+            # haskell/compile.bzl for what it costs.
+            "per_module": attrs.bool(default = False),
             # Libraries that are part of this one, as the C of a Cabal package
             # is part of its library: their objects are in its archive, and
             # linked into its shared library, and what depends on it isn't

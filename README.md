@@ -25,6 +25,37 @@ buck2 build my-package:my-program -m opt
 
 There are other build options that can be selected in a similar way, such as `-m prof` to enable profiling. See `constraints/BUCK` for details.
 
+# Per-module compilation (experimental)
+
+By default each `haskell_library()`/`haskell_binary()` is compiled by one
+`ghc --make` action. With `per_module = True` (what `cabal buck2 --per-module`
+sets on every target) a target is compiled one module per action instead:
+a `ghc -M` action computes the module graph, and each module's `ghc -c` gets
+a symlink tree of the interfaces and objects of its transitive imports. Buck2
+then schedules the modules of a target in parallel with everything else, and
+each module's action records in a dep file what it read, so after an edit
+only the modules whose imports' ABI changed are recompiled, within a package
+and across packages. The recompilation policy is exactly the one `ghc --make`
+has, taken from the usages GHC writes into each interface (the imports, by
+ABI hash, and the objects a Template Haskell splice loaded), decided per
+action by buck2.
+
+The cost is that each one-shot compile starts a GHC and loads the interfaces
+of its imports (and, for Template Haskell, the shared libraries of the
+dependencies), which `--make` does once per target: a target's modules take
+several times the CPU in total, whether or not they use Template Haskell,
+and a clean compile of a target is slower than with `--make` even with every
+core busy. Which way is faster for a given project depends on how its time
+divides between clean builds and rebuilds after small edits. The
+implementation is `_compile_per_module` in `prelude/haskell/compile.bzl`.
+
+Two settings help the per-module build and cost nothing elsewhere: run
+buck2 with `-j` set to the number of physical cores (the one-shot compiles
+gain nothing from SMT siblings and each takes memory), and give GHC a
+larger allocation area, `compiler_flags = +RTS -A64m -RTS` in the
+`[haskell]` section of the buckconfig (see below), which took 13% off the
+per-module compiles of one project.
+
 # Compiler and linker flags from the environment
 
 buck2 runs every build action with a clean environment, so directories that
