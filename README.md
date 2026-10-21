@@ -25,6 +25,31 @@ buck2 build my-package:my-program -m opt
 
 There are other build options that can be selected in a similar way, such as `-m prof` to enable profiling. See `constraints/BUCK` for details.
 
+# Per-module compilation (experimental)
+
+By default each `haskell_library()`/`haskell_binary()` is compiled by one
+`ghc --make` action. With `per_module = True` (which
+`cabal buck2 --per-module` sets on every target), each module is compiled
+by an action of its own. buck2 then compiles a target's modules in
+parallel with everything else it has to do, and after an edit recompiles
+only the modules that GHC's own recompilation check would: a comment-only
+edit recompiles the one module, and a change to a module's interface
+recompiles the modules that import it.
+
+The cost is CPU. Each module's compile starts a GHC and reads the
+interfaces of its imports, which `--make` does once per target, so a
+target's modules take several times the CPU in total, and a clean compile
+of a target is slower than with `--make` even with every core busy. Which
+way is faster for a project depends on how its time divides between clean
+builds and rebuilds after small edits.
+
+Two settings help the per-module build and cost nothing elsewhere: run
+buck2 with `-j` set to the number of physical cores (the compiles gain
+nothing from SMT siblings, and each takes memory), and give GHC a larger
+allocation area, `compiler_flags = +RTS -A64m -RTS` in the `[haskell]`
+section of the buckconfig (see below), which took 13% off the per-module
+compiles of one project.
+
 # Compiler and linker flags from the environment
 
 buck2 runs every build action with a clean environment, so directories that

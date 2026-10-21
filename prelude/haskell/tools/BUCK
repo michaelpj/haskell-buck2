@@ -12,6 +12,13 @@ prelude.python_bootstrap_binary(
     visibility = ["PUBLIC"],
 )
 
+# The scripts of the per-module compiles (see _compile_per_module in
+# prelude/haskell/compile.bzl).
+prelude.export_file(
+    name = "per_module_compile.sh",
+    visibility = ["PUBLIC"],
+)
+
 # Type checking target for Python tool scripts
 prelude.python_library(
     name = "scripts-typing",
