@@ -15,6 +15,11 @@ prelude.python_bootstrap_binary(
 # The scripts of the per-module compiles (see _compile_per_module in
 # prelude/haskell/compile.bzl).
 prelude.export_file(
+    name = "per_module_deps.sh",
+    visibility = ["PUBLIC"],
+)
+
+prelude.export_file(
     name = "per_module_compile.sh",
     visibility = ["PUBLIC"],
 )

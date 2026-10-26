@@ -18,6 +18,15 @@ HaskellLibraryProvider = provider(
     },
 )
 
+# The files of a module compiled per module that its dependents' modules
+# read: its interface, the file of its ABI hash, and for a -dynamic-too
+# compile its dynamic interface.
+HaskellModuleFiles = record(
+    hi = field(Artifact),
+    abi = field(Artifact),
+    dyn_hi = field(Artifact | None, None),
+)
+
 # A record of a Haskell library.
 HaskellLibraryInfo = record(
     # The library target name: e.g. "rts"
@@ -40,6 +49,19 @@ HaskellLibraryInfo = record(
     version = str,
     is_prebuilt = bool,
     profiling_enabled = bool,
+    # The rest are set for a library compiled per module only: see Note
+    # [Compiling against dependencies module by module] in compile.bzl.
+    # Its package db without the library, registered before anything is
+    # compiled.
+    early_db = field(Artifact | None, None),
+    # Each module's files, by module name.
+    modules = field(dict[str, HaskellModuleFiles] | None, None),
+    # Each module's transitive closure of imports across packages, as JSON:
+    # module -> list of [package id, module].
+    closures = field(Artifact | None, None),
+    # The "<package path>/__<target>__/" part of the path of its interfaces'
+    # directory, by which dependents match `ghc -M` output to it.
+    module_dir_tail = field(str | None, None),
 )
 
 HaskellLibraryInfoTSet = transitive_set()

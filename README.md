@@ -36,6 +36,15 @@ only the modules that GHC's own recompilation check would: a comment-only
 edit recompiles the one module, and a change to a module's interface
 recompiles the modules that import it.
 
+Across targets, a module waits only for the modules it imports from a
+dependency that is itself compiled per module, not for the whole
+dependency, so it can start before that dependency is fully compiled, let
+alone linked. The exception is a module that runs Template Haskell (or
+evaluates an `ANN` pragma), which needs the dependencies' libraries and
+waits for all of them to be linked. Which modules run Template Haskell is
+decided by the extensions they (or their target) enable, so enabling
+`TemplateHaskell` for a whole package makes all of its modules wait.
+
 The cost is CPU. Each module's compile starts a GHC and reads the
 interfaces of its imports, which `--make` does once per target, so a
 target's modules take several times the CPU in total, and a clean compile

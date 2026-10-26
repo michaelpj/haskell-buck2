@@ -14,6 +14,7 @@ load(
 load(
     "@prelude//haskell:library_info.bzl",
     "HaskellLibraryInfoTSet",
+    "HaskellModuleFiles",
 )
 load(
     "@prelude//haskell:toolchain.bzl",
@@ -25,6 +26,7 @@ load(
     "attr_deps_haskell_lib_infos",
     "attr_deps_haskell_link_infos",
     "get_artifact_suffix",
+    "haskell_library_unit_id",
     "is_haskell_src",
     "module_name_to_file",
     "output_extensions",
@@ -42,6 +44,11 @@ CompileResultInfo = record(
     hi = field(Artifact),
     stubs = field(Artifact),
     producing_indices = field(bool),
+    # Per-module compilation only: see HaskellLibraryInfo's fields of the
+    # same names.
+    modules = field(dict[str, HaskellModuleFiles] | None, None),
+    closures = field(Artifact | None, None),
+    module_dir_tail = field(str | None, None),
 )
 
 CompileArgsInfo = record(
@@ -55,7 +62,11 @@ PackagesInfo = record(
     exposed_package_args = cmd_args,
     packagedb_args = cmd_args,
     transitive_deps = field(HaskellLibraryInfoTSet),
+    # The interface dirs of the local libraries built with --make (all of
+    # them when not `early`, see get_packages_info).
     local_import_dirs = field(list[Artifact], []),
+    # The local libraries compiled per module, by package id.
+    module_libs = field(dict[str, typing.Any], {}),
 )
 
 def _package_flag(toolchain: HaskellToolchainInfo) -> str:
@@ -64,7 +75,12 @@ def _package_flag(toolchain: HaskellToolchainInfo) -> str:
     else:
         return "-package"
 
-def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_version: bool, enable_profiling: bool, import_dirs_tag = None) -> PackagesInfo:
+def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_version: bool, enable_profiling: bool, import_dirs_tag = None, early: bool = False) -> PackagesInfo:
+    # `early`: use the early package dbs of the dependencies compiled per
+    # module (those registered before the library exists), and don't make
+    # their interface directories, libraries or stub directories inputs: the
+    # caller declares the interfaces it imports itself. For a compile that
+    # runs no Template Haskell, which needs no library of any dependency.
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
 
     # Collect library dependencies. Note that these don't need to be in a
@@ -82,7 +98,13 @@ def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_v
     packagedb_set = {}
 
     local_import_dirs = []
+    module_libs = {}
     for lib in libs.traverse():
+        if lib.modules != None:
+            module_libs[lib.name] = lib
+        if early and lib.early_db != None:
+            packagedb_set[lib.early_db] = None
+            continue
         packagedb_set[lib.db] = None
         import_dirs = list(lib.import_dirs.values())
         local_import_dirs += [d for d in import_dirs if not d.is_source]
@@ -140,6 +162,7 @@ def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_v
         packagedb_args = packagedb_args,
         transitive_deps = libs,
         local_import_dirs = local_import_dirs,
+        module_libs = module_libs,
     )
 
 def _ghc_flags(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, pkgname = None, dynamic_too: bool = False) -> (cmd_args, cmd_args):
@@ -395,8 +418,9 @@ def compile(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool,
 
 # ---------------------------------------------------------------------------
 # Per-module compilation (`per_module = True`): one `ghc -c` action per module
-# instead of one `ghc --make` per target. See Note [Per-module compilation]
-# and Note [Early cut-off by dep files].
+# instead of one `ghc --make` per target. See Note [Per-module compilation],
+# Note [Early cut-off by dep files], Note [Compiling against dependencies
+# module by module] and Note [Template Haskell modules].
 
 # The suffix of the srcs entry of a module's .hs-boot, and of its outputs.
 _BOOT = "-boot"
@@ -451,26 +475,57 @@ def _dir_of(artifact, node: str, ext: str) -> cmd_args:
     # extension.
     return cmd_args(artifact, parent = _node_file(node, ext).count("/") + 1)
 
-def _read_deps_makefile(label, text: str, nodes: list) -> dict:
-    # From `ghc -M` output: each node's imports among the target's nodes.
+def _listed_node(path: str, nodes: list) -> str | None:
+    # The node of a source by a path a script was given for it: its project
+    # path, or a generated source's output path, which ends with that.
+    for n, src in nodes:
+        if not _is_boot(n) and (path == src.short_path or path.endswith("/" + src.short_path)):
+            return n
+    return None
+
+def _read_deps_makefile(label, text: str, nodes: list, direct_module_libs: dict, out_marker: str):
+    # From `ghc -M` output: each node's imports among the target's nodes, and
+    # the (package id, module) pairs it imports from the dependencies
+    # compiled per module.
     by_stem = {_source_stem(src): n for n, src in nodes if not _is_boot(n)}
     imports = {n: [] for n, _ in nodes}
+    upstream = {n: [] for n, _ in nodes}
     for line in text.splitlines():
         if line.startswith("#") or ":" not in line:
             continue
         lhs, rhs = line.split(":", 1)
-        tgt = _node_from_path(lhs.strip(), by_stem)
-        dep = _node_from_path(rhs.strip(), by_stem)
-        if tgt == None or dep == None or tgt == dep:
+        lhs = lhs.strip()
+        rhs = rhs.strip()
+        tgt = _node_from_path(lhs, by_stem)
+        if tgt == None:
+            continue
+        if rhs.startswith("buck-out/") and out_marker in rhs:
+            # An interface of a dependency compiled per module: which
+            # one, by the longest tail that matches (a package's path
+            # may end with another's).
+            lib = None
+            for tail, candidate in direct_module_libs.items():
+                if tail in rhs and (lib == None or len(tail) > len(lib.module_dir_tail)):
+                    lib = candidate
+            if lib != None:
+                mod_path = rhs.split(out_marker, 1)[1]
+                dot = mod_path.rfind(".")
+                ext = mod_path[dot + 1:]
+                mod = mod_path[:dot].replace("/", ".") + (_BOOT if ext.endswith(_BOOT) else "")
+                if mod in lib.modules and (lib.name, mod) not in upstream[tgt]:
+                    upstream[tgt].append((lib.name, mod))
+            continue
+        dep = _node_from_path(rhs, by_stem)
+        if dep == None or tgt == dep:
             # A module's dependency on its own source, or a file that
-            # isn't one of the target's (a header the C preprocessor
-            # includes, say).
+            # isn't one of the target's (an interface of a dependency
+            # built with --make or prebuilt, a header, ...).
             continue
         if tgt not in imports or dep not in imports:
             fail("{}: `ghc -M` says {} depends on {}, but srcs has no such module (or boot file)".format(label, tgt, dep))
         if dep not in imports[tgt]:
             imports[tgt].append(dep)
-    return imports
+    return imports, upstream
 
 def _transitive_closure(nodes: list, imports: dict) -> dict:
     # Each node's imports, transitively; iteratively: Starlark has no
@@ -505,19 +560,48 @@ def _dependency_order(label, nodes: list, imports: dict) -> list[str]:
         fail("{}: import cycle among {}".format(label, ", ".join([n for n, _ in nodes if n not in done])))
     return order
 
+def _read_splices(text: str, nodes: list):
+    # From the deps script's output: the nodes it found Template Haskell (or
+    # an ANN pragma) in. A line is a source's path, then "th".
+    th = {}
+    for line in text.splitlines():
+        words = line.split()
+        n = _listed_node(words[0], nodes) if words else None
+        if n != None and words[1:2] == ["th"]:
+            th[n] = True
+    return th
+
 def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, pkgname: str | None, native_shared_libs_dir: [Artifact, None], dynamic_too: bool) -> CompileResultInfo:
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
     suffix = get_artifact_suffix(link_style, enable_profiling)
     osuf, hisuf = output_extensions(link_style, enable_profiling)
     prefix = per_module_dir(link_style, enable_profiling)
+    out_marker = "/" + prefix + "out/"
 
     # The tag of everything a module's dep file may list: see Note [Early
     # cut-off by dep files].
     tag = ctx.actions.artifact_tag()
 
-    packages = get_packages_info(ctx, link_style, specify_pkg_version = False, enable_profiling = enable_profiling, import_dirs_tag = tag)
+    # The package flags of a module that runs Template Haskell: the final dbs
+    # of every dependency, libraries included; and of any other module: the
+    # early dbs, without
+    # the interface dirs or libraries of the dependencies compiled per module
+    # (declared per module below).
+    def packages(info):
+        return struct(
+            args = cmd_args(info.exposed_package_args, info.packagedb_args),
+            local_import_dirs = info.local_import_dirs,
+        )
+
+    early_packages = get_packages_info(ctx, link_style, specify_pkg_version = False, enable_profiling = enable_profiling, import_dirs_tag = tag, early = True)
+    early_set = packages(early_packages)
+    target_th = packages(get_packages_info(ctx, link_style, specify_pkg_version = False, enable_profiling = enable_profiling, import_dirs_tag = tag))
+    th_target = "-XTemplateHaskell" in ctx.attrs.compiler_flags or "-XQuasiQuotes" in ctx.attrs.compiler_flags
+    module_libs = early_packages.module_libs
+    this_pkg = pkgname or haskell_library_unit_id(ctx.label)
+
     cmd_flags, file_flags = _ghc_flags(ctx, link_style, enable_profiling, pkgname, dynamic_too)
-    base_cmd = cmd_args(haskell_toolchain.compiler, cmd_flags, file_flags, packages.exposed_package_args, packages.packagedb_args)
+    base_cmd = cmd_args(haskell_toolchain.compiler, cmd_flags, file_flags)
     env = _ghc_env(ctx, prefix + "build-tool-depends")
 
     # The nodes of the graph: the modules, and their boot files as
@@ -532,9 +616,10 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     src_of = {n: src for n, src in nodes}
 
     # The outputs, all in one directory (so not at content-based paths),
-    # which is the import path of every module's compile here, with the
-    # directories the rest of the rules consume, which are assembled from
-    # them.
+    # which is the import path of every module's compile here and, through
+    # the early package db, of the modules of dependents. Declared outside
+    # the dynamic output so that they can be exported, with the directories
+    # the rest of the rules consume, which are assembled from them.
     o_of = {}
     hi_of = {}
     abi_of = {}
@@ -547,35 +632,92 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
         if dynamic_too:
             dyn_o_of[n] = ctx.actions.declare_output(prefix + "out/" + _node_file(n, "dyn_o"), has_content_based_path = False)
             dyn_hi_of[n] = ctx.actions.declare_output(prefix + "out/" + _node_file(n, "dyn_hi"), has_content_based_path = False)
+    closures = ctx.actions.declare_output(prefix + "closures.json", has_content_based_path = False)
     objects = ctx.actions.declare_output("objects-" + suffix, dir = True, has_content_based_path = False)
     hi = ctx.actions.declare_output("hi-" + suffix, dir = True, has_content_based_path = False)
     stubs = ctx.actions.declare_output("stubs-" + suffix, dir = True, has_content_based_path = False)
     producing_indices = _producing_indices(ctx)
 
-    # The tree of the dependencies' shared libraries goes to the compile,
-    # which puts it on LD_LIBRARY_PATH, as a tagged argument rather than in
-    # the environment, so that a change to one only re-runs the modules
-    # whose dep file lists it (the Template Haskell ones).
-    ld_tree = tag.tag_artifacts(cmd_args(native_shared_libs_dir)) if native_shared_libs_dir != None else None
+    # How dependents recognise this target's interfaces in their `ghc -M`
+    # output: buck2 puts a target's outputs under <package>/__<name>__/ in
+    # buck-out, and ours under per-module-<suffix>/out/ below that. Nothing
+    # else in the rules depends on buck-out's layout; this does, because the
+    # paths come back from GHC as text.
+    module_dir_tail = "/" + (ctx.label.package + "/" if ctx.label.package else "") + "__" + ctx.label.name + "__/"
 
-    # The module graph. The boot files aren't arguments: GHC finds them next
-    # to the sources.
+    # The tree of the dependencies' shared libraries (which depends on every
+    # dependency's link) goes to the Template Haskell modules' compiles only,
+    # not to every compile and the module graph. The compile puts it on
+    # LD_LIBRARY_PATH; it is a tagged argument rather than in the
+    # environment, so that a change to it only re-runs the modules whose dep
+    # file lists it.
+    target_ld_tree = tag.tag_artifacts(cmd_args(native_shared_libs_dir)) if native_shared_libs_dir != None else None
+
+    # The module graph, with the interfaces each module imports from the
+    # dependencies (by the paths their package dbs give them, which need not
+    # exist yet), and which modules run Template Haskell (see the script).
+    # Against the early dbs, so it needs nothing built. The boot files aren't
+    # arguments: GHC finds them next to the sources.
     deps_mk = ctx.actions.declare_output(prefix + "deps.mk")
+    splices_file = ctx.actions.declare_output(prefix + "splices.txt")
+    hs_srcs = [src for n, src in nodes if not _is_boot(n)]
     deps_cmd = cmd_args(
         base_cmd,
+        early_set.args,
         "-M",
+        "-include-pkg-deps",
         "-dep-makefile",
         deps_mk.as_output(),
         "-dep-suffix",
         "",
-        [src for n, src in nodes if not _is_boot(n)],
+        hs_srcs,
         hidden = [src for n, src in nodes if _is_boot(n)],
     )
-    ctx.actions.run(_in_env(env, deps_cmd), category = "haskell_deps_" + suffix.replace("-", "_"))
+    ctx.actions.run(
+        _in_env(env, cmd_args("sh", ctx.attrs._per_module_deps, splices_file.as_output(), hs_srcs, "--", deps_cmd)),
+        category = "haskell_deps_" + suffix.replace("-", "_"),
+    )
+
+    # The dependencies compiled per module whose modules this target can
+    # import (its direct dependencies), by the tail of their output path.
+    direct_module_libs = {}
+    for lib in attr_deps_haskell_lib_infos(ctx, link_style, enable_profiling):
+        if lib.modules != None and lib.module_dir_tail != None:
+            direct_module_libs[lib.module_dir_tail] = lib
+
+    # The import directories the dep-file writer looks interfaces up in: the
+    # --make libraries' (whole), and for a module that runs no Template
+    # Haskell the per-module libraries' output directories.
+    def out_dir_of(lib):
+        for m, files in lib.modules.items():
+            return _dir_of(files.hi, m, hisuf)
+        return None
+
+    module_lib_dirs = [d for d in [out_dir_of(lib) for lib in module_libs.values()] if d != None]
 
     def f(ctx, artifacts, outputs):
-        imports = _read_deps_makefile(ctx.label, artifacts[deps_mk].read_string(), nodes)
+        imports, upstream = _read_deps_makefile(ctx.label, artifacts[deps_mk].read_string(), nodes, direct_module_libs, out_marker)
         closure = _transitive_closure(nodes, imports)
+
+        # The closure across packages: this module's and its in-package
+        # closure's imports from dependencies, and those modules' own
+        # closures (which their targets wrote out, transitively complete).
+        dep_closures = {lib.name: artifacts[lib.closures].read_json() for lib in direct_module_libs.values()}
+        full = {}
+        for n, _ in nodes:
+            entries = {}
+            for x in [n] + closure[n]:
+                for pkg, mod in upstream[x]:
+                    entries[(pkg, mod)] = True
+                    for pm in dep_closures.get(pkg, {}).get(mod, []):
+                        entries[(pm[0], pm[1])] = True
+            full[n] = list(entries.keys())
+        ctx.actions.write_json(
+            outputs[closures].as_output(),
+            {n: [[this_pkg, d] for d in closure[n]] + [[p, m] for p, m in full[n]] for n, _ in nodes},
+        )
+
+        th_nodes = _read_splices(artifacts[splices_file].read_string(), nodes)
 
         # Actions are registered in dependency order: a symlinked_dir can
         # only link artifacts that an action already produces.
@@ -589,6 +731,25 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
                 closure_files += [outputs[hi_of[d]], outputs[abi_of[d]], outputs[o_of[d]]]
                 if dynamic_too:
                     closure_files += [outputs[dyn_hi_of[d]], outputs[dyn_o_of[d]]]
+            runs_th = not _is_boot(n) and (th_target or n in th_nodes)
+            upstream_files = []
+            if runs_th:
+                mod_packages, ld_tree = target_th, target_ld_tree
+                hidirs = mod_packages.local_import_dirs
+            else:
+                mod_packages, ld_tree = early_set, None
+                hidirs = mod_packages.local_import_dirs + module_lib_dirs
+
+                # The interfaces this module may read from the per-module
+                # dependencies: its imports' closure.
+                for pkg, mod in full[n]:
+                    lib = module_libs.get(pkg)
+                    if lib == None or mod not in lib.modules:
+                        continue
+                    files = lib.modules[mod]
+                    upstream_files += [files.hi, files.abi]
+                    if files.dyn_hi != None:
+                        upstream_files.append(files.dyn_hi)
 
             # The module's own flags, after those of its session.
             stubdir = ctx.actions.declare_output(prefix + "stubs/" + n, dir = True, has_content_based_path = False)
@@ -597,6 +758,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
             module_flags.add("-ddump-hi", "-ddump-to-file", cmd_args(outputs[abi_of[n]].as_output(), format = "-ddump-file-prefix={}"))
             if closure[n]:
                 module_flags.add(tag.tag_artifacts(cmd_args(_dir_of(outputs[hi_of[closure[n][0]]], closure[n][0], hisuf), hidden = closure_files, format = "-i{}")))
+            if upstream_files:
+                module_flags.add(tag.tag_artifacts(cmd_args(hidden = upstream_files)))
             if dynamic_too:
                 module_flags.add("-dyno", outputs[dyn_o_of[n]].as_output(), "-dynohi", outputs[dyn_hi_of[n]].as_output())
             if producing_indices:
@@ -621,10 +784,11 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
                 # The script only needs their paths; as inputs they are
                 # dep-file governed like everything else the module may
                 # read.
-                tag.tag_artifacts(cmd_args(packages.local_import_dirs, format = "--hidir={}")),
+                tag.tag_artifacts(cmd_args(hidirs, format = "--hidir={}")),
                 cmd_args(mkdirs, format = "--mkdir={}"),
                 "--",
                 base_cmd,
+                mod_packages.args,
                 "--",
                 module_flags,
             )
@@ -651,18 +815,22 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
         ctx.actions.symlinked_dir(outputs[hi].as_output(), hi_map, has_content_based_path = False)
         ctx.actions.symlinked_dir(outputs[stubs].as_output(), {}, has_content_based_path = False)
 
-    all_outputs = [objects.as_output(), hi.as_output(), stubs.as_output()]
+    all_outputs = [objects.as_output(), hi.as_output(), stubs.as_output(), closures.as_output()]
     for n, _ in nodes:
         all_outputs += [o_of[n].as_output(), hi_of[n].as_output(), abi_of[n].as_output()]
         if dynamic_too:
             all_outputs += [dyn_o_of[n].as_output(), dyn_hi_of[n].as_output()]
     ctx.actions.dynamic_output(
-        dynamic = [deps_mk],
+        dynamic = [deps_mk, splices_file] + [lib.closures for lib in direct_module_libs.values()],
         inputs = [src for _, src in nodes],
         outputs = all_outputs,
         f = f,
     )
-    return CompileResultInfo(objects = objects, hi = hi, stubs = stubs, producing_indices = producing_indices)
+    modules = {
+        n: HaskellModuleFiles(hi = hi_of[n], abi = abi_of[n], dyn_hi = dyn_hi_of[n] if dynamic_too else None)
+        for n, _ in nodes
+    }
+    return CompileResultInfo(objects = objects, hi = hi, stubs = stubs, producing_indices = producing_indices, modules = modules, closures = closures, module_dir_tail = module_dir_tail)
 
 # Note [Per-module compilation]
 #
@@ -712,6 +880,46 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # The action keeps its previous outputs (no_outputs_cleanup), so that GHC,
 # when it does run, can still find the module up to date, as `--make` does.
 
+# Note [Compiling against dependencies module by module]
+#
+# A module that runs no Template Haskell needs only the interfaces it
+# imports from its dependencies, and their transitive closure, which GHC
+# reads for instances and type families. A dependency compiled per module
+# writes those one by one, so the module depends on them alone, not on the
+# dependency's whole interface directory or its library, and can start
+# before the dependency is fully compiled, let alone linked.
+#
+# It compiles against the dependency's early package db (see the `early`
+# argument of _make_package in haskell.bzl): the package without its
+# library, whose import directory is the one the dependency's modules write
+# their interfaces to, registered before anything is compiled. Its final
+# db, registered once the library is built, is the one a --make compile
+# uses. The interfaces a module imports come from `ghc -M -include-pkg-deps`,
+# which names each by the path the package db gives it, before it exists;
+# the path's tail (module_dir_tail) says which dependency it belongs to, the
+# one place the rules depend on buck-out's layout. Their closure comes from
+# the dependencies' own: every per-module target writes out the closure of
+# each of its modules across packages, transitively complete, so a target
+# reads only its direct dependencies'.
+
+# Note [Template Haskell modules]
+#
+# A module that runs Template Haskell, or evaluates an ANN pragma (which
+# GHC does with its interpreter too), runs its dependencies' code at
+# compile time, so it needs their libraries, not just their interfaces. It
+# compiles against the dependencies' final package dbs, with their
+# libraries as inputs and the tree of their shared libraries on
+# LD_LIBRARY_PATH, so it waits for all of them to be linked, as a --make
+# compile does. The tree is given to these modules' compiles alone, as a
+# tagged input, so that a relink re-runs only the modules whose dep files
+# list it.
+#
+# Which modules run Template Haskell is decided before any compile, from
+# the target's flags and from the sources: the deps script
+# (tools/per_module_deps.sh) looks for the extensions' names and for ANN
+# pragmas. It can find too much (a name in a comment), which only makes a
+# module wait for more.
+
 # Note [Reading the interface text]
 #
 # The dep file of a module is taken from the interface GHC wrote for it, by
@@ -730,4 +938,3 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # way it builds its other tools; the Stack project's hi-file-parser library
 # reads the same fields without the GHC API, by following the format by hand
 # per release.
-
