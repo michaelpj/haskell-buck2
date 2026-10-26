@@ -214,7 +214,9 @@ haskell_library = prelude_rule(
             # anything not compiled per module) needs no listing: its
             # library is there from the start. A splice that runs code from
             # a dependency not listed fails to compile, saying which symbol
-            # it couldn't load.
+            # it couldn't load. A module with explicit level imports
+            # (ExplicitLevelImports) waits for the libraries of what it
+            # imports at the splice level instead.
             "th_build_depends": attrs.option(attrs.list(attrs.dep()), default = None),
             # Libraries that are part of this one, as the C of a Cabal package
             # is part of its library: their objects are in its archive, and

@@ -67,6 +67,13 @@ runs code from a dependency left out fails to compile, naming the symbol it
 couldn't load. With `cabal buck2`, set it in the project's overrides
 (`cabal-buck2.bzl`).
 
+A module with `ExplicitLevelImports` (GHC 9.14 and later) or
+`NoImplicitStagePersistence` needs no listing: GHC lets its splices run
+only what it imports with `import splice`, so it waits for the libraries of
+the dependencies those imports come from (and, when it so imports a module
+of its own target, of the dependencies that module imports from), and for
+the other dependencies only as any other module does.
+
 The cost is CPU. Each module's compile starts a GHC and reads the
 interfaces of its imports, which `--make` does once per target, so a
 target's modules take several times the CPU in total, and a clean compile

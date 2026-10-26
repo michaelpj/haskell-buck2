@@ -148,9 +148,10 @@ def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_v
     )
 
 # The package db flags for the given libraries (the dependencies, direct and
-# transitive), and the inputs they bring: see get_packages_info. Also run by
-# a per-module compile for each set of final dbs its modules use (see
-# _compile_per_module), with the libraries it has already collected.
+# transitive), and the inputs they bring: see get_packages_info. Also run in
+# the dynamic output of a per-module compile, for the modules that choose
+# their own final dbs (see _compile_per_module), so it takes the libraries
+# rather than an analysis context.
 def _package_dbs(libs: list, early: bool, final: [dict[str, bool], None], import_dirs_tag):
     packagedb_args = cmd_args()
     packagedb_set = {}
@@ -443,8 +444,8 @@ def compile(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool,
 # Per-module compilation (`per_module = True`): one `ghc -c` action per module
 # instead of one `ghc --make` per target. See Note [Per-module compilation],
 # Note [Early cut-off by dep files], Note [Compiling against dependencies
-# module by module], Note [Template Haskell modules] and Note [The
-# persistent worker].
+# module by module], Note [Template Haskell modules], Note [Explicit level
+# imports] and Note [The persistent worker].
 
 # The suffix of the srcs entry of a module's .hs-boot, and of its outputs.
 _BOOT = "-boot"
@@ -586,14 +587,24 @@ def _dependency_order(label, nodes: list, imports: dict) -> list[str]:
 
 def _read_splices(text: str, nodes: list):
     # From the deps script's output: the nodes it found Template Haskell (or
-    # an ANN pragma) in. A line is a source's path, then "th".
+    # an ANN pragma) in, and those with explicit level imports, with the
+    # modules they import at the splice level. A line is a source's path,
+    # then "th" if it runs Template Haskell, then "splice" and the modules if
+    # it has explicit level imports.
     th = {}
+    splice_imports = {}
     for line in text.splitlines():
         words = line.split()
         n = _listed_node(words[0], nodes) if words else None
-        if n != None and words[1:2] == ["th"]:
+        if n == None:
+            continue
+        rest = words[1:]
+        if rest[:1] == ["th"]:
             th[n] = True
-    return th
+            rest = rest[1:]
+        if rest[:1] == ["splice"]:
+            splice_imports[n] = rest[1:]
+    return th, splice_imports
 
 # The version of the worker's request and of what it writes back (see
 # tools/ghc-worker and the per-module compile script, which take the same
@@ -612,7 +623,8 @@ _WORKER_CONTRACT = "2"
 # - trees: for each of those, the tree of its shared libraries;
 # - labels: their package ids, by target;
 # - base, base_tree: the same for all the dependencies not compiled per
-#   module together, whose libraries exist from the start.
+#   module together, whose libraries exist from the start;
+# - all_trees: every one of those trees.
 #
 # There are no trees when nothing is linked shared.
 def _splice_deps(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, prefix: str, native_shared_libs_dir: [Artifact, None]):
@@ -649,7 +661,9 @@ def _splice_deps(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
         closures[lib.name] = [l.name for l in ctx.actions.tset(HaskellLibraryInfoTSet, children = [info] if info != None else []).traverse()]
         trees[lib.name] = tree(lib.name, [shlib] if shlib != None else [])
     base = [l.name for l in ctx.actions.tset(HaskellLibraryInfoTSet, children = base_infos).traverse()]
-    return struct(closures = closures, trees = trees, labels = labels, base = base, base_tree = tree("_", base_shlibs))
+    base_tree = tree("_", base_shlibs)
+    all_trees = [t for t in [base_tree] + trees.values() if t != None]
+    return struct(closures = closures, trees = trees, labels = labels, base = base, base_tree = base_tree, all_trees = all_trees)
 
 # The final dbs and shared library trees of a module that runs Template
 # Haskell whose splices run code from the given dependencies compiled per
@@ -712,7 +726,9 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 
     # The trees of the shared libraries a Template Haskell module loads
     # (which depend on their links) are given to those modules' actions
-    # only, below, not to every compile and the module graph.
+    # only, below, not to every compile and the module graph. A module with
+    # explicit level imports chooses its own, see Note [Explicit level
+    # imports]; the others take the target's.
     splice_deps = _splice_deps(ctx, link_style, enable_profiling, prefix, native_shared_libs_dir)
     th_set = _th_set(ctx, splice_deps)
     if th_set == None:
@@ -722,6 +738,7 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
         target_th = packages(th_set[0])
         target_th_trees = th_set[1]
     th_target = "-XTemplateHaskell" in ctx.attrs.compiler_flags or "-XQuasiQuotes" in ctx.attrs.compiler_flags
+    eli_target = "-XExplicitLevelImports" in ctx.attrs.compiler_flags or "-XNoImplicitStagePersistence" in ctx.attrs.compiler_flags
     module_libs = early_packages.module_libs
     this_pkg = pkgname or haskell_library_unit_id(ctx.label)
 
@@ -731,14 +748,16 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 
     # The persistent worker, if there is one: see Note [The persistent
     # worker]. The target's own (one the project builds) comes before the
-    # toolchain's.
+    # toolchain's. Its environment names every tree a module may be given:
+    # see Note [Explicit level imports].
+    all_th_trees = {t: None for t in target_th_trees + splice_deps.all_trees}.keys()
     worker_info = None
     worker = ctx.attrs.per_module_worker[RunInfo] if getattr(ctx.attrs, "per_module_worker", None) != None else haskell_toolchain.per_module_worker
     if worker != None:
         worker_cmd = _in_env(env, cmd_args(worker))
         worker_info = WorkerInfo(
             exe = worker_cmd,
-            env = {"LD_LIBRARY_PATH": cmd_args(target_th_trees, delimiter = ":", ignore_artifacts = True)} if target_th_trees else {},
+            env = {"LD_LIBRARY_PATH": cmd_args(all_th_trees, delimiter = ":", ignore_artifacts = True)} if all_th_trees else {},
         )
 
     # The nodes of the graph: the modules, and their boot files as
@@ -798,13 +817,17 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     # which puts them on LD_LIBRARY_PATH, as a tagged argument rather than
     # in the environment, so that a change to one only re-runs the modules
     # whose dep file lists it (the Template Haskell ones).
-    target_ld_tree = tag.tag_artifacts(cmd_args(target_th_trees, delimiter = ":")) if target_th_trees else None
+    def ld_tree_arg(trees):
+        return tag.tag_artifacts(cmd_args(trees, delimiter = ":")) if trees else None
+
+    target_ld_tree = ld_tree_arg(target_th_trees)
 
     # The module graph, with the interfaces each module imports from the
     # dependencies (by the paths their package dbs give them, which need not
-    # exist yet), and which modules run Template Haskell (see the script).
-    # Against the early dbs, so it needs nothing built. The boot files aren't
-    # arguments: GHC finds them next to the sources.
+    # exist yet), and which modules run Template Haskell and import what at
+    # the splice level (see the script). Against the early dbs, so it needs
+    # nothing built. The boot files aren't arguments: GHC finds them next to
+    # the sources.
     deps_mk = ctx.actions.declare_output(prefix + "deps.mk")
     splices_file = ctx.actions.declare_output(prefix + "splices.txt")
     hs_srcs = [src for n, src in nodes if not _is_boot(n)]
@@ -821,7 +844,7 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
         hidden = [src for n, src in nodes if _is_boot(n)],
     )
     ctx.actions.run(
-        _in_env(env, cmd_args("sh", ctx.attrs._per_module_deps, splices_file.as_output(), hs_srcs, "--", deps_cmd)),
+        _in_env(env, cmd_args("sh", ctx.attrs._per_module_deps, splices_file.as_output(), "1" if eli_target else "0", hs_srcs, "--", deps_cmd)),
         category = "haskell_deps_" + suffix.replace("-", "_"),
     )
 
@@ -864,7 +887,33 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
             {n: [[this_pkg, d] for d in closure[n]] + [[p, m] for p, m in full[n]] for n, _ in nodes},
         )
 
-        th_nodes = _read_splices(artifacts[splices_file].read_string(), nodes)
+        th_nodes, splice_imports = _read_splices(artifacts[splices_file].read_string(), nodes)
+
+        # The package flags and library trees of a module with explicit
+        # level imports: the final dbs of the packages its splices run code
+        # from, those of the modules it imports at the splice level and, for
+        # a module of this target, those its own imports bring, and the
+        # early dbs of the rest. Shared by the modules that come to the same
+        # packages.
+        eli_sets = {}
+
+        def eli_packages(n):
+            pkgs = {}
+            for m in splice_imports[n]:
+                if m in src_of:
+                    for x in [m] + closure[m]:
+                        for pkg, _ in upstream[x]:
+                            pkgs[pkg] = True
+                else:
+                    for pkg, mod in upstream[n]:
+                        if mod == m:
+                            pkgs[pkg] = True
+            names = sorted(pkgs.keys())
+            key = " ".join(names)
+            if key not in eli_sets:
+                final, trees = _splice_set(splice_deps, names)
+                eli_sets[key] = (packages(final), ld_tree_arg(trees))
+            return eli_sets[key]
 
         # Actions are registered in dependency order: a symlinked_dir can
         # only link artifacts that an action already produces.
@@ -881,6 +930,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
             runs_th = not _is_boot(n) and (th_target or n in th_nodes)
             if not runs_th:
                 mod_packages, ld_tree = early_set, None
+            elif n in splice_imports:
+                mod_packages, ld_tree = eli_packages(n)
             else:
                 mod_packages, ld_tree = target_th, target_ld_tree
             hidirs = mod_packages.local_import_dirs + [d for name, d in module_lib_dirs.items() if d != None and name in mod_packages.early_names]
@@ -1085,6 +1136,9 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # its set alone. A splice that runs code from a dependency left out fails
 # to compile, naming the symbol it couldn't load.
 #
+# A module with explicit level imports chooses its own set, whatever
+# th_build_depends says: see Note [Explicit level imports].
+#
 # Which modules run Template Haskell is decided before any compile, from
 # the target's flags and from the sources: the deps script
 # (tools/per_module_deps.sh) looks for the extensions' names and for ANN
@@ -1163,3 +1217,36 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # libraries was linked against those), and the early dbs of the rest. Every
 # other module compiles against the early dbs, and never starts the
 # interpreter.
+
+# Note [Explicit level imports]
+#
+# With ExplicitLevelImports (GHC 9.14 and later), or NoImplicitStagePersistence,
+# a splice or ANN pragma can use only what the module imports with `import
+# splice`: a name imported otherwise, even from the Prelude, is a level
+# error. So those imports say what code a module's splices may run: the
+# modules of dependencies, whose packages' libraries (closed over their own
+# dependencies, see Note [Libraries of the early package dbs]) the compile
+# then needs, and the modules of the target, whose objects are the compile's
+# inputs anyway and whose own imports from dependencies bring those
+# packages' libraries in turn. Such a module compiles against the final dbs
+# of those and of the dependencies not compiled per module, whatever
+# th_build_depends says, and against the early dbs of the rest.
+#
+# `ghc -M` doesn't say at which level a module imports another (nor does
+# anything else before the compile: the interface records it afterwards), so
+# the deps script (tools/per_module_deps.sh) reads it from the source: the
+# extensions from the LANGUAGE and OPTIONS_GHC pragmas and the target's
+# flags, and the import declarations with `splice` before or after the
+# module name, wherever their lines break.
+# That can find too much (an import in a comment, or in a CPP branch not
+# taken), which only makes the compile wait for more; to find too little
+# would take an import made by a CPP macro, and a splice running code from a
+# library the compile doesn't have fails, naming the symbol it couldn't load.
+#
+# The set of libraries differs from module to module, and so do the trees
+# of shared libraries on its LD_LIBRARY_PATH (see _splice_deps). The
+# persistent worker's environment is fixed when it starts, before the
+# modules' sets are known, so it names every tree: the dynamic linker skips
+# one that isn't there, or a link in it to a library not built yet, and a
+# module's own trees are inputs of its compile.
+
