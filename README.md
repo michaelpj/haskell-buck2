@@ -40,10 +40,32 @@ Across targets, a module waits only for the modules it imports from a
 dependency that is itself compiled per module, not for the whole
 dependency, so it can start before that dependency is fully compiled, let
 alone linked. The exception is a module that runs Template Haskell (or
-evaluates an `ANN` pragma), which needs the dependencies' libraries and
-waits for all of them to be linked. Which modules run Template Haskell is
-decided by the extensions they (or their target) enable, so enabling
-`TemplateHaskell` for a whole package makes all of its modules wait.
+evaluates an `ANN` pragma), which needs the libraries of the dependencies
+whose code its splices run, and by default waits for all of the
+dependencies' libraries. Which modules run Template Haskell is decided by
+the extensions they (or their target) enable, so enabling
+`TemplateHaskell` for a whole package makes all of its modules wait. A
+target can say which of its dependencies compiled per module its splices
+run code from, with `th_build_depends`:
+
+```
+haskell_library(
+    name = "model",
+    per_module = True,
+    # The splices are rel8's deriveRel8able and PyF's quasi-quoters, from
+    # Hackage: no dependency of ours.
+    th_build_depends = [],
+    ...
+)
+```
+
+Its Template Haskell modules then wait for the libraries of those (and of
+their own dependencies) alone, and for the other dependencies only as any
+other module does. A dependency not compiled per module (from Hackage, say)
+needs no listing, its library being there from the start. A splice that
+runs code from a dependency left out fails to compile, naming the symbol it
+couldn't load. With `cabal buck2`, set it in the project's overrides
+(`cabal-buck2.bzl`).
 
 The cost is CPU. Each module's compile starts a GHC and reads the
 interfaces of its imports, which `--make` does once per target, so a

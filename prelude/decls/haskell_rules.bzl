@@ -63,6 +63,7 @@ haskell_binary = prelude_rule(
             "_per_module_compile": attrs.default_only(attrs.source(default = "prelude//haskell/tools:per_module_compile.sh")),
             "_per_module_deps": attrs.default_only(attrs.source(default = "prelude//haskell/tools:per_module_deps.sh")),
             "per_module_worker": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),  # as haskell_library's
+            "th_build_depends": attrs.option(attrs.list(attrs.dep()), default = None),  # as haskell_library's
             "linker_flags": attrs.list(attrs.arg(), default = []),
             "platform": attrs.option(attrs.string(), default = None),
         }
@@ -202,6 +203,19 @@ haskell_library = prelude_rule(
             # can't depend on a target the project builds, so each per-module
             # target names it. None: the toolchain's, if it has one.
             "per_module_worker": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
+            # With per_module: the dependencies, among this target's deps
+            # compiled per module, whose code its Template Haskell splices
+            # and ANN pragmas run (that code's own dependencies come with
+            # them). A module that runs Template Haskell then waits for
+            # the libraries of those alone, and compiles against the
+            # interfaces of the rest as soon as it imports them, as any
+            # other module does. None (the default): all of the
+            # dependencies. A dependency built from a Hackage package (or
+            # anything not compiled per module) needs no listing: its
+            # library is there from the start. A splice that runs code from
+            # a dependency not listed fails to compile, saying which symbol
+            # it couldn't load.
+            "th_build_depends": attrs.option(attrs.list(attrs.dep()), default = None),
             # Libraries that are part of this one, as the C of a Cabal package
             # is part of its library: their objects are in its archive, and
             # linked into its shared library, and what depends on it isn't

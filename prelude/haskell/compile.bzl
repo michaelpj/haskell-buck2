@@ -14,7 +14,19 @@ load(
 load(
     "@prelude//haskell:library_info.bzl",
     "HaskellLibraryInfoTSet",
+    "HaskellLibraryProvider",
     "HaskellModuleFiles",
+)
+load(
+    "@prelude//haskell:link_info.bzl",
+    "HaskellLinkInfo",
+)
+load(
+    "@prelude//linking:shared_libraries.bzl",
+    "SharedLibraryInfo",
+    "create_shlib_symlink_tree",
+    "merge_shared_libraries",
+    "traverse_shared_library_info",
 )
 load(
     "@prelude//haskell:toolchain.bzl",
@@ -67,6 +79,8 @@ PackagesInfo = record(
     local_import_dirs = field(list[Artifact], []),
     # The local libraries compiled per module, by package id.
     module_libs = field(dict[str, typing.Any], {}),
+    # Those of them whose early dbs are used, by package id.
+    early_names = field(dict[str, bool], {}),
 )
 
 def _package_flag(toolchain: HaskellToolchainInfo) -> str:
@@ -75,7 +89,7 @@ def _package_flag(toolchain: HaskellToolchainInfo) -> str:
     else:
         return "-package"
 
-def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_version: bool, enable_profiling: bool, import_dirs_tag = None, early: bool = False) -> PackagesInfo:
+def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_version: bool, enable_profiling: bool, import_dirs_tag = None, early: bool = False, final: [dict[str, bool], None] = None) -> PackagesInfo:
     # `early`: use the early package dbs of the dependencies compiled per
     # module (those registered before the library exists), and don't make
     # their interface directories, libraries or stub directories inputs: the
@@ -92,42 +106,9 @@ def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_v
     )
 
     package_flag = _package_flag(haskell_toolchain)
-    exposed_package_args = cmd_args()
-
-    packagedb_args = cmd_args()
-    packagedb_set = {}
-
-    local_import_dirs = []
-    module_libs = {}
-    for lib in libs.traverse():
-        if lib.modules != None:
-            module_libs[lib.name] = lib
-        if early and lib.early_db != None:
-            packagedb_set[lib.early_db] = None
-            continue
-        packagedb_set[lib.db] = None
-        import_dirs = list(lib.import_dirs.values())
-        local_import_dirs += [d for d in import_dirs if not d.is_source]
-        # libs of dependencies might be needed at compile time if we're
-        # using Template Haskell. Per-module compiles track which of these
-        # (and the interface dirs) they actually read through a dep file,
-        # see _compile_per_module.
-        dep_governed = [import_dirs, lib.libs]
-        if import_dirs_tag != None:
-            dep_governed = [import_dirs_tag.tag_artifacts(cmd_args(hidden = dep_governed))]
-        hidden_args = cmd_args(
-            hidden = [
-                lib.stub_dirs,
-            ] + dep_governed,
-        )
-
-        exposed_package_args.add(hidden_args)
-
-        packagedb_args.add(hidden_args)
-
-    # These we need to add for all the packages/dependencies, i.e.
-    # direct and transitive (e.g. `fbcode-common-hs-util-hs-array`)
-    packagedb_args.add([cmd_args("-package-db", x) for x in packagedb_set])
+    dbs = _package_dbs(list(libs.traverse()), early, final, import_dirs_tag)
+    exposed_package_args = cmd_args(dbs.hidden)
+    module_libs = {lib.name: lib for lib in libs.traverse() if lib.modules != None}
 
     haskell_direct_deps_lib_infos = attr_deps_haskell_lib_infos(
         ctx,
@@ -159,11 +140,53 @@ def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_v
 
     return PackagesInfo(
         exposed_package_args = exposed_package_args,
-        packagedb_args = packagedb_args,
+        packagedb_args = dbs.packagedb_args,
         transitive_deps = libs,
-        local_import_dirs = local_import_dirs,
+        local_import_dirs = dbs.local_import_dirs,
         module_libs = module_libs,
+        early_names = dbs.early_names,
     )
+
+# The package db flags for the given libraries (the dependencies, direct and
+# transitive), and the inputs they bring: see get_packages_info. Also run by
+# a per-module compile for each set of final dbs its modules use (see
+# _compile_per_module), with the libraries it has already collected.
+def _package_dbs(libs: list, early: bool, final: [dict[str, bool], None], import_dirs_tag):
+    packagedb_args = cmd_args()
+    packagedb_set = {}
+    hidden = cmd_args()
+
+    local_import_dirs = []
+    early_names = {}
+    for lib in libs:
+        if early and lib.early_db != None and (final == None or lib.name not in final):
+            packagedb_set[lib.early_db] = None
+            early_names[lib.name] = True
+            continue
+        packagedb_set[lib.db] = None
+        import_dirs = list(lib.import_dirs.values())
+        local_import_dirs += [d for d in import_dirs if not d.is_source]
+        # libs of dependencies might be needed at compile time if we're
+        # using Template Haskell. Per-module compiles track which of these
+        # (and the interface dirs) they actually read through a dep file,
+        # see _compile_per_module.
+        dep_governed = [import_dirs, lib.libs]
+        if import_dirs_tag != None:
+            dep_governed = [import_dirs_tag.tag_artifacts(cmd_args(hidden = dep_governed))]
+        hidden_args = cmd_args(
+            hidden = [
+                lib.stub_dirs,
+            ] + dep_governed,
+        )
+
+        hidden.add(hidden_args)
+
+        packagedb_args.add(hidden_args)
+
+    # These we need to add for all the packages/dependencies, i.e.
+    # direct and transitive (e.g. `fbcode-common-hs-util-hs-array`)
+    packagedb_args.add([cmd_args("-package-db", x) for x in packagedb_set])
+    return struct(packagedb_args = packagedb_args, hidden = hidden, local_import_dirs = local_import_dirs, early_names = early_names)
 
 def _ghc_flags(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, pkgname = None, dynamic_too: bool = False) -> (cmd_args, cmd_args):
     # The flags of a compile of the context's sources other than its
@@ -578,6 +601,86 @@ def _read_splices(text: str, nodes: list):
 # the worker's, when either changes.
 _WORKER_CONTRACT = "2"
 
+# What a module that runs Template Haskell may compile against, by the
+# direct dependencies its splices run code from (see Note [Template Haskell
+# modules]):
+#
+# - closures: for each dependency compiled per module, by package id, the
+#   package ids of its closure, whose final dbs the module then uses (each
+#   of their libraries was linked against the others, see Note [Libraries
+#   of the early package dbs]);
+# - trees: for each of those, the tree of its shared libraries;
+# - labels: their package ids, by target;
+# - base, base_tree: the same for all the dependencies not compiled per
+#   module together, whose libraries exist from the start.
+#
+# There are no trees when nothing is linked shared.
+def _splice_deps(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, prefix: str, native_shared_libs_dir: [Artifact, None]):
+    closures = {}
+    trees = {}
+    labels = {}
+    base_infos = []
+    base_shlibs = []
+
+    def link_info(d):
+        link = d.get(HaskellLinkInfo)
+        if link == None:
+            return None
+        return link.prof_info[link_style] if enable_profiling else link.info[link_style]
+
+    def tree(name, shlibs):
+        if native_shared_libs_dir == None or not shlibs:
+            return None
+        sos = traverse_shared_library_info(merge_shared_libraries(ctx.actions, deps = shlibs), transformation_provider = None)
+        return create_shlib_symlink_tree(actions = ctx.actions, out = prefix + "th-shared-libs/" + name, shared_libs = sos) if sos else None
+
+    for d in attr_deps(ctx) + ctx.attrs.template_deps:
+        provider = d.get(HaskellLibraryProvider)
+        lib = (provider.prof_lib if enable_profiling else provider.lib)[link_style] if provider != None else None
+        info = link_info(d)
+        shlib = d.get(SharedLibraryInfo)
+        if lib == None or lib.modules == None:
+            if info != None:
+                base_infos.append(info)
+            if shlib != None:
+                base_shlibs.append(shlib)
+            continue
+        labels[d.label.raw_target()] = lib.name
+        closures[lib.name] = [l.name for l in ctx.actions.tset(HaskellLibraryInfoTSet, children = [info] if info != None else []).traverse()]
+        trees[lib.name] = tree(lib.name, [shlib] if shlib != None else [])
+    base = [l.name for l in ctx.actions.tset(HaskellLibraryInfoTSet, children = base_infos).traverse()]
+    return struct(closures = closures, trees = trees, labels = labels, base = base, base_tree = tree("_", base_shlibs))
+
+# The final dbs and shared library trees of a module that runs Template
+# Haskell whose splices run code from the given dependencies compiled per
+# module (package ids), and from every dependency not compiled per module.
+def _splice_set(splice_deps, names: list[str]):
+    final = {n: True for n in splice_deps.base}
+    trees = [splice_deps.base_tree] if splice_deps.base_tree != None else []
+    for name in names:
+        for n in splice_deps.closures[name]:
+            final[n] = True
+        if splice_deps.trees[name] != None:
+            trees.append(splice_deps.trees[name])
+    return final, trees
+
+# The final dbs and shared library trees of the target's Template Haskell
+# modules: all of the dependencies, or with th_build_depends those listed,
+# with the early dbs of the rest. None for all of them.
+def _th_set(ctx: AnalysisContext, splice_deps):
+    th_deps = getattr(ctx.attrs, "th_build_depends", None)
+    if th_deps == None:
+        return None
+    names = []
+    deps = {d.label.raw_target(): True for d in attr_deps(ctx) + ctx.attrs.template_deps}
+    for d in th_deps:
+        t = d.label.raw_target()
+        if t not in deps:
+            fail("{}: th_build_depends names {}, which is not a dependency".format(ctx.label.raw_target(), t))
+        if t in splice_deps.labels:
+            names.append(splice_deps.labels[t])
+    return _splice_set(splice_deps, names)
+
 def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, pkgname: str | None, native_shared_libs_dir: [Artifact, None], dynamic_too: bool) -> CompileResultInfo:
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
     suffix = get_artifact_suffix(link_style, enable_profiling)
@@ -589,20 +692,35 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     # cut-off by dep files].
     tag = ctx.actions.artifact_tag()
 
-    # The package flags of a module that runs Template Haskell: the final dbs
-    # of every dependency, libraries included (see Note [Libraries of the
-    # early package dbs]); and of any other module: the early dbs, without
-    # the interface dirs or libraries of the dependencies compiled per module
-    # (declared per module below).
-    def packages(info):
+    # The package flags of a module: the final dbs of the given dependencies
+    # (None: all of them), and the early dbs of the rest, without their
+    # interface dirs or libraries (declared per module below). See Note
+    # [Libraries of the early package dbs]. A module that runs no Template
+    # Haskell compiles against the early dbs alone.
+    early_packages = get_packages_info(ctx, link_style, specify_pkg_version = False, enable_profiling = enable_profiling, import_dirs_tag = tag, early = True)
+    dep_libs = list(early_packages.transitive_deps.traverse())
+
+    def packages(final):
+        dbs = _package_dbs(dep_libs, final != None, final, tag)
         return struct(
-            args = cmd_args(info.exposed_package_args, info.packagedb_args),
-            local_import_dirs = info.local_import_dirs,
+            args = cmd_args(early_packages.exposed_package_args, dbs.packagedb_args),
+            local_import_dirs = dbs.local_import_dirs,
+            early_names = dbs.early_names,
         )
 
-    early_packages = get_packages_info(ctx, link_style, specify_pkg_version = False, enable_profiling = enable_profiling, import_dirs_tag = tag, early = True)
-    early_set = packages(early_packages)
-    target_th = packages(get_packages_info(ctx, link_style, specify_pkg_version = False, enable_profiling = enable_profiling, import_dirs_tag = tag))
+    early_set = packages({})
+
+    # The trees of the shared libraries a Template Haskell module loads
+    # (which depend on their links) are given to those modules' actions
+    # only, below, not to every compile and the module graph.
+    splice_deps = _splice_deps(ctx, link_style, enable_profiling, prefix, native_shared_libs_dir)
+    th_set = _th_set(ctx, splice_deps)
+    if th_set == None:
+        target_th = packages(None)
+        target_th_trees = [native_shared_libs_dir] if native_shared_libs_dir != None else []
+    else:
+        target_th = packages(th_set[0])
+        target_th_trees = th_set[1]
     th_target = "-XTemplateHaskell" in ctx.attrs.compiler_flags or "-XQuasiQuotes" in ctx.attrs.compiler_flags
     module_libs = early_packages.module_libs
     this_pkg = pkgname or haskell_library_unit_id(ctx.label)
@@ -620,7 +738,7 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
         worker_cmd = _in_env(env, cmd_args(worker))
         worker_info = WorkerInfo(
             exe = worker_cmd,
-            env = {"LD_LIBRARY_PATH": cmd_args(native_shared_libs_dir, ignore_artifacts = True)} if native_shared_libs_dir != None else {},
+            env = {"LD_LIBRARY_PATH": cmd_args(target_th_trees, delimiter = ":", ignore_artifacts = True)} if target_th_trees else {},
         )
 
     # The nodes of the graph: the modules, and their boot files as
@@ -676,13 +794,11 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     # paths come back from GHC as text.
     module_dir_tail = "/" + (ctx.label.package + "/" if ctx.label.package else "") + "__" + ctx.label.name + "__/"
 
-    # The tree of the dependencies' shared libraries (which depends on every
-    # dependency's link) goes to the Template Haskell modules' compiles only,
-    # not to every compile and the module graph. The compile puts it on
-    # LD_LIBRARY_PATH; it is a tagged argument rather than in the
-    # environment, so that a change to it only re-runs the modules whose dep
-    # file lists it.
-    target_ld_tree = tag.tag_artifacts(cmd_args(native_shared_libs_dir)) if native_shared_libs_dir != None else None
+    # The trees of the dependencies' shared libraries go to the compile,
+    # which puts them on LD_LIBRARY_PATH, as a tagged argument rather than
+    # in the environment, so that a change to one only re-runs the modules
+    # whose dep file lists it (the Template Haskell ones).
+    target_ld_tree = tag.tag_artifacts(cmd_args(target_th_trees, delimiter = ":")) if target_th_trees else None
 
     # The module graph, with the interfaces each module imports from the
     # dependencies (by the paths their package dbs give them, which need not
@@ -717,14 +833,14 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
             direct_module_libs[lib.module_dir_tail] = lib
 
     # The import directories the dep-file writer looks interfaces up in: the
-    # --make libraries' (whole), and for a module that runs no Template
-    # Haskell the per-module libraries' output directories.
+    # --make libraries' (whole), and the output directories of the per-module
+    # libraries a module compiles against the early dbs of.
     def out_dir_of(lib):
         for m, files in lib.modules.items():
             return _dir_of(files.hi, m, hisuf)
         return None
 
-    module_lib_dirs = [d for d in [out_dir_of(lib) for lib in module_libs.values()] if d != None]
+    module_lib_dirs = {name: out_dir_of(lib) for name, lib in module_libs.items()}
 
     def f(ctx, artifacts, outputs):
         imports, upstream = _read_deps_makefile(ctx.label, artifacts[deps_mk].read_string(), nodes, direct_module_libs, out_marker)
@@ -763,24 +879,24 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
                 if dynamic_too:
                     closure_files += [outputs[dyn_hi_of[d]], outputs[dyn_o_of[d]]]
             runs_th = not _is_boot(n) and (th_target or n in th_nodes)
-            upstream_files = []
-            if runs_th:
-                mod_packages, ld_tree = target_th, target_ld_tree
-                hidirs = mod_packages.local_import_dirs
-            else:
+            if not runs_th:
                 mod_packages, ld_tree = early_set, None
-                hidirs = mod_packages.local_import_dirs + module_lib_dirs
+            else:
+                mod_packages, ld_tree = target_th, target_ld_tree
+            hidirs = mod_packages.local_import_dirs + [d for name, d in module_lib_dirs.items() if d != None and name in mod_packages.early_names]
 
-                # The interfaces this module may read from the per-module
-                # dependencies: its imports' closure.
-                for pkg, mod in full[n]:
-                    lib = module_libs.get(pkg)
-                    if lib == None or mod not in lib.modules:
-                        continue
-                    files = lib.modules[mod]
-                    upstream_files += [files.hi, files.abi]
-                    if files.dyn_hi != None:
-                        upstream_files.append(files.dyn_hi)
+            # The interfaces this module may read from the per-module
+            # dependencies it compiles against the early dbs of: its
+            # imports' closure.
+            upstream_files = []
+            for pkg, mod in full[n]:
+                lib = module_libs.get(pkg)
+                if lib == None or mod not in lib.modules or pkg not in mod_packages.early_names:
+                    continue
+                files = lib.modules[mod]
+                upstream_files += [files.hi, files.abi]
+                if files.dyn_hi != None:
+                    upstream_files.append(files.dyn_hi)
 
             # The module's own flags, after those of its session.
             stubdir = ctx.actions.declare_output(prefix + "stubs/" + n, dir = True, has_content_based_path = False)
@@ -950,14 +1066,24 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 #
 # A module that runs Template Haskell, or evaluates an ANN pragma (which
 # GHC does with its interpreter too), runs its dependencies' code at
-# compile time, so it needs their libraries, not just their interfaces. It
-# compiles against the dependencies' final package dbs, with their
-# libraries as inputs and the tree of their shared libraries on
+# compile time, so it needs their libraries, not just their interfaces. By
+# default it compiles against all the dependencies' final package dbs, with
+# their libraries as inputs and the tree of their shared libraries on
 # LD_LIBRARY_PATH, so it waits for all of them to be linked, as a --make
-# compile does. The tree is given to these modules' compiles alone, as a
-# tagged input, so that a relink re-runs only the modules whose dep files
-# list it. The other modules compile against the early dbs, which name no
+# compile does. The trees are given to these modules' compiles alone, as
+# tagged inputs, so that a relink re-runs only the modules whose dep files
+# list the library. The other modules compile against the early dbs, which name no
 # library: see Note [Libraries of the early package dbs].
+#
+# A target's th_build_depends narrows that to the dependencies its splices
+# run code from (see _th_set). Its Template Haskell modules then compile
+# against the final dbs of those and of every dependency not compiled per
+# module, whose libraries exist from the start, closed over their own
+# dependencies, and against the early dbs of the rest. The shared libraries
+# are in a tree per dependency compiled per module, and one for the rest
+# (see _splice_deps), so that a module's LD_LIBRARY_PATH can list those of
+# its set alone. A splice that runs code from a dependency left out fails
+# to compile, naming the symbol it couldn't load.
 #
 # Which modules run Template Haskell is decided before any compile, from
 # the target's flags and from the sources: the deps script
@@ -1032,5 +1158,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # none. The early dbs name none: they are what a module compiles against
 # before its dependencies are linked. A module that runs Template Haskell
 # compiles against the final dbs of the packages whose libraries it
-# depends on, here all of them; every other module against the early dbs,
-# and never starts the interpreter.
+# depends on: all of them, or with th_build_depends those listed and those
+# not compiled per module, closed over their dependencies (each of their
+# libraries was linked against those), and the early dbs of the rest. Every
+# other module compiles against the early dbs, and never starts the
+# interpreter.
