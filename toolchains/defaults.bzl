@@ -1,4 +1,5 @@
 load("@third-party-haskell//:tools.bzl", "CC_FINGERPRINT", "GHC_DYNAMIC", "GHC_FINGERPRINT", "GHC_VERSION")
+load(":per_module_worker.bzl", "toolchain_per_module_worker")
 load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
 load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
 load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
@@ -44,6 +45,8 @@ def default_haskell_toolchain(name, **kwargs):
     # here would read the toolchains cell's own (nonexistent) one.
     kwargs.setdefault("compiler_flags", read_root_config("haskell", "compiler_flags", "").split())
     kwargs.setdefault("linker_flags", read_root_config("haskell", "linker_flags", "").split())
+    # See per_module_worker.bzl.
+    kwargs.setdefault("per_module_worker", toolchain_per_module_worker())
     # GHC_DYNAMIC comes from buck2/gen-haskell-prebuilt.py's own probe
     # of this specific `ghc` binary (`ghc --info`'s `("GHC Dynamic",
     # ...)` entry) - not assumed - so retargeting GHC (per this file's

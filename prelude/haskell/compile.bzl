@@ -31,6 +31,8 @@ load(
 load(
     "@prelude//haskell:toolchain.bzl",
     "HaskellToolchainInfo",
+    "compile_env_script",
+    "in_compile_env",
 )
 load(
     "@prelude//haskell:util.bzl",
@@ -364,17 +366,7 @@ def compile_args(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
 def _ghc_env(ctx: AnalysisContext, build_tool_dir: str):
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
 
-    # compile_env's values are shell-evaluated (via `sh -c`) rather than
-    # passed straight through as literal env values - this lets a value
-    # like "$(clang -print-file-name=libclang_rt.asan-x86_64.so)" get
-    # resolved fresh at actual build-action execution time, matching this
-    # project's existing convention of resolving tools via $PATH at
-    # build-action time rather than baking absolute host paths into .bzl
-    # or BUCK files (see toolchains/BUCK's `compiler`/`packager`).
-    script = "".join([
-        'export {}="{}"; '.format(name, value)
-        for name, value in haskell_toolchain.compile_env.items()
-    ]) if haskell_toolchain.compile_env else ""
+    script = compile_env_script(haskell_toolchain.compile_env) if haskell_toolchain.compile_env else ""
     args = []
 
     build_tool_dirs = {
@@ -388,9 +380,7 @@ def _ghc_env(ctx: AnalysisContext, build_tool_dir: str):
 
 # A command run in such an environment.
 def _in_env(env, cmd: cmd_args) -> cmd_args:
-    if not env.script:
-        return cmd
-    return cmd_args(["sh", "-c", env.script + 'exec "$@"', "sh"] + env.args, cmd)
+    return in_compile_env(env.script, env.args, cmd)
 
 # Compile all the context's sources.
 def compile(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, pkgname: str | None = None, native_shared_libs_dir: [Artifact, None] = None, dynamic_too: bool = False) -> CompileResultInfo:
@@ -695,13 +685,19 @@ def _read_splices(text: str, nodes: list):
 # - trees: for each of those, the tree of its shared libraries;
 # - labels: their package ids, by target;
 # - base, base_tree: the same for all the dependencies not compiled per
-#   module together, whose libraries every such module gets.
+#   module together, whose libraries every such module gets;
+# - all_trees: every one of those trees;
+# - prebuilt: the trees, by package id ("_" for base_tree), whose libraries
+#   are all prebuilt, not built by buck2. A prebuilt library is expected to
+#   find its own dependencies (by its RUNPATH), so a process that loads
+#   only those needs none of the trees on its LD_LIBRARY_PATH.
 #
 # There are no trees when nothing is linked shared.
 def _splice_deps(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, prefix: str, native_shared_libs_dir: [Artifact, None]):
     closures = {}
     trees = {}
     labels = {}
+    prebuilt = {}
     base_infos = []
     base_shlibs = []
 
@@ -715,7 +711,11 @@ def _splice_deps(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
         if native_shared_libs_dir == None or not shlibs:
             return None
         sos = traverse_shared_library_info(merge_shared_libraries(ctx.actions, deps = shlibs), transformation_provider = None)
-        return create_shlib_symlink_tree(actions = ctx.actions, out = prefix + "th-shared-libs/" + name, shared_libs = sos) if sos else None
+        if not sos:
+            return None
+        if all([isinstance(so.lib.output, Artifact) and so.lib.output.is_source for so in sos]):
+            prebuilt[name] = True
+        return create_shlib_symlink_tree(actions = ctx.actions, out = prefix + "th-shared-libs/" + name, shared_libs = sos)
 
     for d in attr_deps(ctx) + ctx.attrs.template_deps:
         provider = d.get(HaskellLibraryProvider)
@@ -732,14 +732,18 @@ def _splice_deps(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
         closures[lib.name] = [l.name for l in ctx.actions.tset(HaskellLibraryInfoTSet, children = [info] if info != None else []).traverse()]
         trees[lib.name] = tree(lib.name, [shlib] if shlib != None else [])
     base = [l.name for l in ctx.actions.tset(HaskellLibraryInfoTSet, children = base_infos).traverse()]
-    return struct(closures = closures, trees = trees, labels = labels, base = base, base_tree = tree("_", base_shlibs))
+    base_tree = tree("_", base_shlibs)
+    all_trees = [t for t in [base_tree] + trees.values() if t != None]
+    return struct(closures = closures, trees = trees, labels = labels, base = base, base_tree = base_tree, all_trees = all_trees, prebuilt = prebuilt)
 
 # The final dbs and shared library trees of a module that runs Template
 # Haskell whose splices run code from the given dependencies compiled per
-# module (package ids), and from every dependency not compiled per module.
+# module (package ids), and from every dependency not compiled per module;
+# and whether all of those trees are prebuilt (see _splice_deps).
 def _splice_set(splice_deps, names: list[str]):
     final = {n: True for n in splice_deps.base}
     trees = [splice_deps.base_tree] if splice_deps.base_tree != None else []
+    prebuilt = splice_deps.base_tree == None or "_" in splice_deps.prebuilt
     for name in names:
         # A package that is no direct dependency (one whose module a
         # dependency re-exports) comes with the direct dependencies whose
@@ -750,7 +754,8 @@ def _splice_set(splice_deps, names: list[str]):
                 final[n] = True
             if splice_deps.trees[d] != None and splice_deps.trees[d] not in trees:
                 trees.append(splice_deps.trees[d])
-    return struct(final = final, trees = trees)
+                prebuilt = prebuilt and d in splice_deps.prebuilt
+    return struct(final = final, trees = trees, prebuilt = prebuilt)
 
 # The final dbs and shared library trees of the target's Template Haskell
 # modules: all of the dependencies, or with th_build_depends those listed,
@@ -860,6 +865,25 @@ def _reaches(starts: list[str], target: str, edges: dict, within: list[str]) -> 
         todo = frontier
     return False
 
+# The persistent worker of a target's compile actions, if there is one (see
+# Note [The persistent worker]): the shared worker, or None when the target
+# has a build tool that isn't on the worker's PATH (see
+# per_module_worker_build_tools). A worker the target names
+# (per_module_worker) takes precedence over the toolchain's.
+def _per_module_worker(ctx: AnalysisContext) -> WorkerInfo | None:
+    haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
+    shared_tools = haskell_toolchain.per_module_worker_build_tools
+    if any([t.label.raw_target() not in shared_tools for t in ctx.attrs.build_tool_depends]):
+        return None
+    own_worker = getattr(ctx.attrs, "per_module_worker", None)
+    return own_worker[WorkerInfo] if own_worker != None else haskell_toolchain.per_module_shared_worker
+
+# The version of the worker's request and of what it writes back (see
+# tools/ghc-worker and the per-module compile script, which take the same
+# request): the worker refuses a request of another version. Bump it, and
+# the worker's (tools/ghc-worker/src/Contract.hs), when either changes.
+_WORKER_CONTRACT = "1"
+
 def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, pkgname: str | None, native_shared_libs_dir: [Artifact, None], dynamic_too: bool) -> CompileResultInfo:
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
     suffix = get_artifact_suffix(link_style, enable_profiling)
@@ -886,16 +910,19 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     dep_libs = list(_dependency_libs(ctx, link_style, enable_profiling).traverse())
     exposed_package_args = _exposed_package_args(ctx, link_style, False, enable_profiling)
 
-    def packages(final, trees, runs_th = True):
+    def packages(final, trees, prebuilt, runs_th = True):
         dbs = _package_dbs(dep_libs, final, tag, runs_th)
         return struct(
             args = cmd_args(exposed_package_args, dbs.packagedb_args),
             local_import_dirs = dbs.local_import_dirs,
             early_names = dbs.early_names,
             ld_tree = cmd_args(trees, delimiter = ":") if trees else None,
+            # Whether the trees' libraries are all prebuilt: see Note [The
+            # persistent worker].
+            prebuilt = prebuilt,
         )
 
-    early_set = packages({}, [], runs_th = False)
+    early_set = packages({}, [], prebuilt = True, runs_th = False)
 
     # The trees of the shared libraries a Template Haskell module loads
     # (which depend on their links) are given to those modules' actions
@@ -906,10 +933,11 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     th_set = _th_set(ctx, splice_deps)
     if th_set == None:
         # No th_build_depends: the final dbs of every dependency, and all
-        # their shared library trees.
-        target_th = packages(None, _splice_set(splice_deps, sorted(splice_deps.closures.keys())).trees)
+        # their shared library trees (whether those are all prebuilt too).
+        all_set = _splice_set(splice_deps, sorted(splice_deps.closures.keys()))
+        target_th = packages(None, all_set.trees, all_set.prebuilt)
     else:
-        target_th = packages(th_set.final, th_set.trees)
+        target_th = packages(th_set.final, th_set.trees, th_set.prebuilt)
     # The extensions the target's flags, or the toolchain's, enable for all
     # its modules.
     flags = (haskell_toolchain.compiler_flags or []) + ctx.attrs.compiler_flags
@@ -918,8 +946,10 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     module_libs = {lib.name: lib for lib in dep_libs if lib.modules != None}
     this_pkg = pkgname or haskell_library_unit_id(ctx.label)
 
-    # A binary's modules too are in a unit named after the target, not
-    # GHC's default `main`, which every binary would share.
+    # A binary's modules too are in a unit named after the target, not GHC's
+    # default `main`: a persistent worker runs splices of many targets in one
+    # process, whose runtime would take one target's module for another's
+    # of the same unit and name.
     cmd_flags, file_flags = _ghc_flags(ctx, link_style, enable_profiling, this_pkg, dynamic_too)
     # The target's other sources (headers a module #includes, say), which
     # GHC records no use of: plain inputs of every compile, as of --make's.
@@ -927,8 +957,23 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     base_cmd = cmd_args(haskell_toolchain.compiler, cmd_flags, file_flags, hidden = other_srcs)
     env = _ghc_env(ctx, prefix + "build-tool-depends")
 
+    worker_info = _per_module_worker(ctx)
+
     nodes = _nodes(ctx)
     src_of = {n: src for n, src in nodes}
+
+    # The tree of the target's sources, the worker's import path (see Note
+    # [The persistent worker]). Tagged: the tree changes with any source of
+    # the target, which is no reason to compile the others again (a
+    # module's own source is an input in its own right).
+    src_tree = None
+    if worker_info != None:
+        src_tree = ctx.actions.symlinked_dir(
+            prefix + "srcs",
+            # (Each by its own extension: .lhs, say, is literate.)
+            {_module_of(n).replace(".", "/") + "." + _split_ext(src.short_path)[1]: src for n, src in nodes},
+            has_content_based_path = False,
+        )
 
     module_outputs = _declare_module_outputs(ctx, per_module_out_dir(ctx, link_style, enable_profiling), nodes, osuf, hisuf, dynamic_too)
     o_of = module_outputs.o
@@ -1036,7 +1081,7 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
             key = " ".join(names)
             if key not in eli_sets:
                 splice_set = _splice_set(splice_deps, names)
-                eli_sets[key] = packages(splice_set.final, splice_set.trees)
+                eli_sets[key] = packages(splice_set.final, splice_set.trees, splice_set.prebuilt)
             return eli_sets[key]
 
         # In the order above, which a symlinked_dir needs too: it can only
@@ -1091,19 +1136,31 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
                 hie_of[n] = ctx.actions.declare_output(prefix + "hie/" + n + "/" + _node_file(n, "hie"), has_content_based_path = False)
                 module_flags.add("-hiedir", _dir_of(hie_of[n].as_output(), n, "hie"))
 
-            # The compile script's request (see the script).
+            # The request, which the worker takes, and the compile script
+            # without it: see Note [The persistent worker].
             depfile = ctx.actions.declare_output(prefix + "dep/" + n + ".dep", has_content_based_path = False)
             request = cmd_args(
+                "--request",
+                "--contract",
+                _WORKER_CONTRACT,
                 "--depfile",
                 tag.tag_artifacts(depfile.as_output()),
                 "--abi",
                 outputs[abi_of[n]].as_output(),
                 "--module",
                 _module_of(n).replace(".", "/"),
+                "--source",
+                src_of[n],
                 "--outdir",
                 _dir_of(outputs[hi_of[n]].as_output(), n, hisuf),
                 "--hisuf",
                 hisuf,
+                "--boot" if _is_boot(n) else [],
+                # The modules behind boot files that its splices may link and
+                # that it waits for. The worker gives the compile their whole interfaces,
+                # see Note [Each compile's home modules] in
+                # tools/ghc-worker/src/Session.hs.
+                ["--link=" + _module_of(d) for d in reads[n] if _is_boot(d) and _module_of(d) in reads[n]] if runs_th[n] else [],
                 ["--ldtree", mod_packages.ld_tree] if mod_packages.ld_tree != None else [],
                 # Paths only: the interfaces the module reads are inputs of
                 # their own (upstream_files, and the --make libraries'
@@ -1111,6 +1168,7 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
                 # per module is named by one of its interfaces, which as an
                 # input would make the module wait for it.
                 cmd_args(hidirs, format = "--hidir={}", ignore_artifacts = True),
+                tag.tag_artifacts(cmd_args(src_tree, format = "--srcroot={}")) if src_tree != None else [],
                 cmd_args(mkdirs, format = "--mkdir={}"),
                 "--",
                 base_cmd,
@@ -1118,12 +1176,13 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
                 "--",
                 module_flags,
             )
-            ctx.actions.run(
-                _in_env(env, cmd_args(ctx.attrs._per_module_compile[RunInfo], request)),
-                category = "haskell_compile_module_" + suffix.replace("-", "_"),
-                identifier = n,
-                dep_files = {"hs": tag},
-            )
+            # The simple compile script that runs the request as one `ghc -c`.
+            script = _in_env(env, cmd_args(ctx.attrs._per_module_compile[RunInfo]))
+            category = "haskell_compile_module_" + suffix.replace("-", "_")
+            if worker_info != None and mod_packages.prebuilt:
+                ctx.actions.run(request, exe = WorkerRunInfo(worker = worker_info, exe = script), category = category, identifier = n, dep_files = {"hs": tag})
+            else:
+                ctx.actions.run(cmd_args(script, request), category = category, identifier = n, dep_files = {"hs": tag})
 
         obj_map = {}
         hi_map = {}
@@ -1172,7 +1231,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 #
 # The price is CPU. Each `ghc -c` reads the interfaces of everything its
 # module imports (and, for Template Haskell, loads the dependencies' shared
-# libraries), which `ghc --make` does only once per target.
+# libraries), which `ghc --make` does only once per target. A persistent
+# worker takes most of that cost away (see Note [The persistent worker]).
 #
 # Terms
 #
@@ -1219,6 +1279,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 #   compile time wait for. Note [Libraries of the early package dbs] has
 #   the package dbs each compile gets, and Note [Explicit level imports]
 #   how a module can say what its splices run.
+# - Note [The persistent worker]: compiling the modules in long-running
+#   GHC sessions rather than a `ghc -c` each.
 
 # Note [Compiling against dependencies module by module]
 #
@@ -1278,7 +1340,9 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # interface text]):
 #
 # - For each imported module, its .abi file, which holds just the
-#   interface's ABI hash. Each action writes one next to its interface.
+#   interface's ABI hash. Each action writes one next to its interface: the
+#   compile script (tools/per_module_compile.py) from the interface's text,
+#   the persistent worker from the interface itself.
 # - Each object of the target's own modules that a Template Haskell splice
 #   loaded, which GHC records as a dependent file. (The dependencies'
 #   _libraries_ are plain inputs instead: see Note [Template Haskell
@@ -1334,9 +1398,9 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # entries out of the dep files, and a module wouldn't compile again when it
 # should.
 #
-# The proper way to read an interface is the GHC API, in a small executable
-# built with the GHC in use, which a project could build like its other
-# tools. We don't do that yet, but could.
+# The proper way to read an interface is the GHC API, which the persistent
+# worker uses (see Note [The persistent worker]). The script is the build's
+# way without the worker.
 
 # Note [Template Haskell modules]
 #
@@ -1385,8 +1449,10 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # 4. Modules behind boot files
 #
 # A splice links all the code it runs, _including_ modules behind boot
-# files: one-shot GHC loads their objects from the output directory. But a
-# module's closure only has the boot file of a {-# SOURCE #-}
+# files. One-shot GHC loads their objects from the output directory. GHC in
+# --make mode (the persistent worker's) looks them up as full modules in its
+# home package table, where the worker puts those the request names with
+# --link. But a module's closure only has the boot file of a {-# SOURCE #-}
 # import, not the real module behind it. So a Template Haskell module also
 # depends on the real modules behind the boot files in its closure, and on
 # their closures (_linked_closure). Otherwise it could be compiled too early,
@@ -1394,7 +1460,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 #
 # Even so, linking a module behind a boot file doesn't always work, and the
 # rules don't currently try to work around that: GHC fails to link some
-# such cases, before 9.12 and with 9.14.1.
+# such cases before 9.12, and with 9.14.1 only the persistent worker links
+# them.
 #
 # 5. Finding the Template Haskell modules
 #
@@ -1462,7 +1529,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # dependencies not compiled per module, whatever th_build_depends says, and
 # against the early dbs of the rest. So the libraries differ from module to
 # module, and so do the trees of shared libraries on its LD_LIBRARY_PATH
-# (see _splice_deps).
+# (see _splice_deps; a module that needs a tree built by buck2 is compiled
+# without the worker, see Note [The persistent worker]).
 #
 # 2. Finding the splice imports
 #
@@ -1473,3 +1541,79 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # flags, and the import declarations with `splice` before or after the
 # module name. That can find too much (an import in a comment, or in a CPP
 # branch not taken), but that's fine, as it's conservative.
+
+# Note [The persistent worker]
+#
+# 1. The problem
+#
+# Even per module, most of the cost over --make is starting a GHC for every
+# module, which reads the interfaces of the module's imports all over again.
+#
+# 2. The solution
+#
+# A buck2 persistent worker is a long-running process that buck2 sends
+# actions to. Ours (tools/ghc-worker) compiles each module as it arrives,
+# concurrently with the others, in a GHC session that keeps the interfaces
+# it has read. It is configured by `[haskell] per_module_worker` (see
+# toolchains/per_module_worker.bzl).
+#
+# 3. The request
+#
+# A module's action is the same request with or without a worker: it goes
+# either to the worker, or to the compile script, which runs it as one
+# `ghc -c`. The request carries the module's source and its compile's flags,
+# in two parts:
+#
+# - The session flags, shared by all the target's modules. The worker keeps
+#   a session for each set of session flags. A target's Template Haskell
+#   modules have session flags of their own, since their package dbs differ
+#   (see Note [Libraries of the early package dbs]).
+# - The module's own flags, which the worker ignores except for -hiedir and
+#   -stubdir.
+#
+# _WORKER_CONTRACT names the version of the request. A worker installed for
+# other rules refuses it.
+#
+# 4. Which worker takes a module
+#
+# buck2 starts a process for each worker (WorkerInfo) that an action names,
+# and keeps it until the end of the build. A worker per target would be
+# hundreds of processes in a large project, each with its own runtime and
+# sessions: far too much memory. So the targets share one worker, made once
+# by the toolchain.
+#
+# The shared worker can only take modules that need nothing from their
+# target's environment, since a process can't change its environment from
+# one request to the next: modules of a target whose build tools are all on
+# the worker's PATH (see per_module_worker_build_tools in
+# toolchains/per_module_worker.bzl), that either run no Template Haskell, or
+# whose splices need no tree of shared libraries built by buck2 on
+# LD_LIBRARY_PATH (prebuilt libraries find their own dependencies, see
+# _splice_deps). The rest are compiled without a worker, each by a `ghc -c`
+# of its own. A worker for each such target, in its environment, would
+# compile them faster, but it would keep its memory (its runtime's, and that
+# of the libraries its splices loaded) until the end of the build, and
+# there may be dozens.
+#
+# With a local worker (`per_module_worker = local`), the worker is a
+# haskell_binary built with the Haskell toolchain, so the toolchain can't
+# depend on it (that would be a cycle). Instead the targets name it
+# themselves (per_module_worker), through a target of its own (see
+# worker.bzl).
+#
+# 5. The import path
+#
+# A session finds the modules a compile imports by name, on an import path.
+# This is a tree of the target's sources alone: in the project's source
+# directories, a module of another target (a sublibrary's, say) would be
+# found before the current target's.
+#
+# 6. Memory and concurrency
+#
+# A worker lives for one build. It drops a target's sessions once the
+# target's modules are all compiled, and keeps a bounded number of
+# sessions, dropping the least recently used idle ones (see Note [Dropping
+# the idle sessions] in tools/ghc-worker/src/Worker.hs). It has no
+# concurrency limit of its own: buck2's -j limits the actions in workers
+# along with the rest, and a lower limit per worker would only hold a
+# target's modules back.

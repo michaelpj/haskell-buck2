@@ -20,6 +20,11 @@ import traceback
 
 MAIN_TARGETS = ["//a:a", "//b:b", "//th:th", "//c:c", "//c:show", "//d:d", "//cyc:cyc", "//main:main", "//rx:rx", "//ux:ux", "//tie:tie", "//rp:rp"]
 ELI_TARGETS = ["//e:e", "//elr:elr"]
+# The modules compiled without the worker even when the project has one
+# (see check_workers): c's splices run th's code; e's and elr's (`import
+# splice`) run a's.
+NO_WORKER = {"c:C.Splice", "c:C.Ann"}
+NO_WORKER_ELI = {"e:E.Gen", "e:E.Lib", "elr:ER.M"}
 
 LOG_DIR = "buck-logs"
 
@@ -60,19 +65,24 @@ def build(*targets, mode=None, keep_going=False):
 IDENTITY = re.compile(r"^(\S+) \(cfg:[^)]*\) \((\S+)(?: (.+))?\)$")
 
 
-def what_ran():
-    """The actions the last build ran, as (target, category, identifier,
-    command) tuples: target as "c:c", without the cell. Not those that
-    buck2 found up to date by their dep files (or in a cache), which
-    what-ran lists too."""
+def what_ran_entries():
+    """The entries of `buck2 log what-ran` for the last build, as JSON."""
     out = buck2("log", "what-ran", "--format", "json").stdout
+    return [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+
+
+def what_ran(entries=None):
+    """The actions the last build ran (or those of the given what-ran
+    entries), as (target, category, identifier, command) tuples: target as
+    "c:c", without the cell. Not those that buck2 found up to date by their
+    dep files (or in a cache), which what-ran lists too, nor the start of a
+    persistent worker, which it lists under the action first sent to the
+    worker."""
     actions = []
-    for line in out.splitlines():
-        if not line.startswith("{"):
-            continue
-        entry = json.loads(line)
+    for entry in (what_ran_entries() if entries is None else entries):
         m = IDENTITY.match(entry["identity"])
-        if not m or entry["reproducer"].get("executor", "").endswith("Cache"):
+        executor = entry["reproducer"].get("executor", "")
+        if not m or executor.endswith("Cache") or executor == "WorkerInit":
             continue
         target = m.group(1).split("//", 1)[1].lstrip(":")
         cmd = entry.get("reproducer", {}).get("details", {}).get("command", [])
@@ -140,22 +150,25 @@ def short(path):
 # --- Reading a per-module compile's command line -----------------------------
 
 def parse_compile(cmd):
-    """The parts of a per_module_compile.py command line that the rules
-    decide: package dbs, LD_LIBRARY_PATH trees, interface dirs."""
-    i = next(n for n, a in enumerate(cmd) if a.endswith("per_module_compile.py"))
-    args = cmd[i + 1:]
+    """The parts of a per-module compile's request (the worker's, or the
+    compile script's arguments) that the rules decide: package dbs,
+    LD_LIBRARY_PATH trees, interface dirs, the modules a splice may link
+    past boot files."""
+    args = cmd[cmd.index("--request"):]
     sep = args.index("--")
     script, rest = args[:sep], args[sep + 1:]
     session = rest[:rest.index("--")]
-    ldtree, hidirs = set(), set()
+    ldtree, hidirs, links = set(), set(), set()
     for n, a in enumerate(script):
         if a == "--ldtree":
             ldtree = {short(p) for p in script[n + 1].split(":")}
         elif a.startswith("--hidir="):
             hidirs.add(short(a[len("--hidir="):]))
+        elif a.startswith("--link="):
+            links.add(a[len("--link="):])
     dbs = {short(session[n + 1]) for n, a in enumerate(session) if a == "-package-db"}
     units = [session[n + 1] for n, a in enumerate(session) if a == "-this-unit-id"]
-    return {"dbs": dbs, "ldtree": ldtree, "hidirs": hidirs, "unit": units[-1] if units else None}
+    return {"dbs": dbs, "ldtree": ldtree, "hidirs": hidirs, "links": links, "unit": units[-1] if units else None}
 
 
 def find_compile(actions, target, module):
@@ -197,9 +210,11 @@ def replace(path, old, new):
 # --- The checks -------------------------------------------------------------------
 
 class State:
-    def __init__(self, eli):
+    def __init__(self, eli, worker):
         self.eli = eli
+        self.worker = worker
         self.targets = MAIN_TARGETS + (ELI_TARGETS if eli else [])
+        self.entries = None
         self.actions = None
 
 
@@ -211,13 +226,56 @@ def check_clean_build(st):
     hs-boot pair of cyc; B.Lit, a literate source."""
     buck2("clean")
     build(*st.targets)
-    st.actions = what_ran()
+    st.entries = what_ran_entries()
+    st.actions = what_ran(st.entries)
     expect_set("modules compiled from clean", compiled_modules(st.actions),
                {"a:A.Base", "a:A.Mid", "a:A.Unused", "b:B.M", "th:TH.Gen", "c:C.Splice", "c:C.Plain", "c:C.Ann",
                 "d:D.Splice", "cyc:Cyc.A", "cyc:Cyc.B", "cyc:Cyc.B-boot", "cyc:Cyc.AS", "rx:R.R", "ux:U.M", "main:Main", "main:Main.Util", "show:Main",
                 "tie:Tie.A", "tie:Tie.B", "tie:Tie.I", "tie:Tie.K", "tie:Tie.I-boot", "tie:Tie.K-boot",
                 "tie:Tie.AZ", "tie:Tie.V", "tie:Tie.W", "tie:Tie.W-boot", "rp:Lib", "rp:User", "b:B.Lit", "b:B.UsesLit", "b:B.Safe"}
                | ({"e:E.Gen", "e:E.Lib", "elr:ER.M"} if st.eli else set()))
+
+
+def check_workers(st):
+    """The module compiles of the clean build ran in the shared persistent
+    worker when the project has one (run.sh with GHC_WORKER), and as
+    processes of their own otherwise. With the worker, those whose splices
+    load libraries built by buck2, which must be on LD_LIBRARY_PATH, ran as
+    processes of their own (see Note [The persistent worker]). Splices that
+    run only GHC's own, prebuilt, packages (d's, cyc's, tie's) need none.
+    So do a target's build tools, if they are all on the worker's PATH
+    (per_module_worker_build_tools, which the project's buckconfig sets to
+    //bt:bt-shared): //bt:shared's module compiles in the worker, and
+    //bt:own's without it."""
+    def executors(entries):
+        compiles = [e for e in entries if "haskell_compile_module_" in e["identity"]]
+        return [(module_of(e), e["reproducer"].get("executor", "")) for e in compiles], [e for e in compiles if e["reproducer"].get("executor") == "WorkerInit"]
+
+    ran, inits = executors(st.entries)
+    build("//bt:shared", "//bt:own")
+    bt, _ = executors(what_ran_entries())
+    bt = set(bt) - {(m, "WorkerInit") for m, _ in bt}
+    if not st.worker:
+        expect_set("how the module compiles ran", {x for _, x in ran} - {"WorkerInit"}, {"Local"})
+        expect_set("how //bt's module compiles ran", bt, {("shared:BT.Shared", "Local"), ("own:BT.Own", "Local")})
+        return
+    expect_set("the modules compiled without the worker", {m for m, x in ran if x == "Local"}, NO_WORKER | (NO_WORKER_ELI if st.eli else set()))
+    expect_set("how the other module compiles ran", {x for _, x in ran} - {"Local", "WorkerInit"}, {"Worker"})
+    expect("one worker (started: {})".format(len(inits)), len(inits) == 1)
+    expect_set("how //bt's module compiles ran", bt, {("shared:BT.Shared", "Worker"), ("own:BT.Own", "Local")})
+    # A target naming its worker (//wk:w, which runs //wk:ghc-worker).
+    build("//wk:wk")
+    entries = what_ran_entries()
+    ran, _ = executors(entries)
+    expect_set("how //wk:wk's module compiles ran", {x for _, x in ran} - {"WorkerInit"}, {"Worker"})
+    named = [e for e in entries if e["reproducer"].get("executor") == "WorkerInit" and any(a == "wk/ghc-worker" or a.endswith("/wk/ghc-worker") for a in e["reproducer"]["details"].get("command", []))]
+    expect("//wk:wk's compiles started the worker it names (//wk:w)", len(named) == 1)
+
+
+def module_of(entry):
+    """A what-ran entry's module, as "target-name:Module"."""
+    m = IDENTITY.match(entry["identity"])
+    return target_name(m.group(1)) + ":" + m.group(3)
 
 
 def check_early_db_conf(st):
@@ -318,13 +376,18 @@ def check_boot(st):
     """The hs-boot pair: the boot file has its own action, which Cyc.A (its
     {-# SOURCE #-} importer) and Cyc.B (checked against it) depend on; its
     own dep file doesn't list its own output, and Cyc.A's lists the boot
-    file's, even once Cyc.B's own is there too."""
+    file's, even once Cyc.B's own is there too. Cyc.AS, whose splice may link
+    Cyc.B past its boot file, names it for the worker; Cyc.B, which runs no
+    splice, names nothing."""
     tagged, _ = dep_file("//cyc:cyc", "haskell_compile_module_shared", "Cyc.B-boot")
     expect_set("Cyc.B-boot's dep file", tagged, set())
     tagged, _ = dep_file("//cyc:cyc", "haskell_compile_module_shared", "Cyc.A")
     expect_set("Cyc.A's dep file", tagged, {"cyc:Cyc.B.abi-boot"})
     tagged, _ = dep_file("//cyc:cyc", "haskell_compile_module_shared", "Cyc.B")
     expect_set("Cyc.B's dep file", tagged, {"cyc:Cyc.A.abi", "cyc:Cyc.B.abi-boot"})
+    # The clean build's compiles (st.actions):
+    expect_set("the modules Cyc.AS links past boot files", find_compile(st.actions, "cyc", "Cyc.AS")["links"], {"Cyc.B"})
+    expect_set("the modules Cyc.B links past boot files", find_compile(st.actions, "cyc", "Cyc.B")["links"], set())
     # Compiled again, with Cyc.B's whole interface there now too: still the
     # boot file's, which is what Cyc.A imports. (The file itself: buck2
     # leaves out of its record entries that aren't inputs of the action, as
@@ -332,6 +395,17 @@ def check_boot(st):
     append("cyc/Cyc/A.hs", "\n-- an edit\n")
     build("//cyc:cyc")
     expect_set("Cyc.A's dep file, compiled again", raw_dep_file("cyc", "cyc", "Cyc.A"), {"cyc:Cyc.B.abi-boot"})
+
+
+def check_tie(st):
+    """Two modules that run Template Haskell, each behind a boot file below
+    the other, would each wait for the other: the first by name doesn't
+    wait for the other, which names it to link past its boot file. Tie.AZ,
+    only behind that cycle, keeps its waits."""
+    expect_set("the modules Tie.I links past boot files", find_compile(st.actions, "tie", "Tie.I")["links"], set())
+    expect_set("the modules Tie.K links past boot files", find_compile(st.actions, "tie", "Tie.K")["links"], {"Tie.I"})
+    expect_set("the modules Tie.AZ, only behind the cycle, links past boot files",
+               find_compile(st.actions, "tie", "Tie.AZ")["links"], {"Tie.I", "Tie.K", "Tie.W"})
 
 
 def index_files(target, *config):
@@ -486,6 +560,7 @@ def check_opt_shared_consumer(st):
 
 CHECKS = [
     check_clean_build,
+    check_workers,
     check_early_db_conf,
     check_cross_package_dep_file,
     check_plain_module_uses_early_dbs,
@@ -493,6 +568,7 @@ CHECKS = [
     check_th_modules_dbs,
     check_explicit_level_imports,
     check_boot,
+    check_tie,
     check_index,
     check_native_library_change,
     check_cutoff_comment,
@@ -513,12 +589,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ghc-version", required=True)
     ap.add_argument("--only", action="append", help="run only this check (by name, without check_); repeatable")
+    ap.add_argument("--worker", action="store_true", help="the project compiles in a persistent worker")
     args = ap.parse_args()
     unknown = set(args.only or []) - {check.__name__[len("check_"):] for check in CHECKS}
     if unknown:
         ap.error("no such check: " + " ".join(sorted(unknown)))
     major, minor = (int(x) for x in args.ghc_version.split(".")[:2])
-    st = State(eli=(major, minor) >= (9, 14))
+    st = State(eli=(major, minor) >= (9, 14), worker=args.worker)
     failed = []
     for check in CHECKS:
         name = check.__name__[len("check_"):]

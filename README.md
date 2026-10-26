@@ -47,11 +47,56 @@ This can be improved in two ways:
 - Otherwise, `th_build_depends` can be used to explicitly specify which
   _local_ dependencies are needed (we always provide the Hackage ones).
 
-The main cost of `per_module` is CPU. Each module's compile starts a GHC 
-and reads the interfaces of its imports, which `--make` does once per target, 
-so a target's modules take several times the CPU in total. The overhead is
-sufficiently high that `per_module` is often significantly worse than 
-`--make`, except when rebuilding a few modules after small edits.
+`per_module` is often much faster at rebuilds:
+
+- With `--make`, an edit to any module rebuilds its whole target from
+  scratch, and then the targets that depend on it, since even a comment
+  changes the target's interfaces.
+- Per module, buck2 compiles the edited module, and then only the modules
+  whose imports' ABI changed: after a comment, just that module; after a
+  new definition, that module and the modules that import it.
+
+How much this saves depends on the module structure. It saves the most for
+edits low in the module graph, in large targets, or in targets that much
+else depends on, and the least for edits to a small target that nothing
+depends on. On the worker's bench, rebuilds after such edits took 0.7-1.2s
+with `per_module` and the worker, against 2-9s with `--make` per target
+(see `tools/ghc-worker/DESIGN.md`).
+
+The main cost of `per_module` is CPU on clean builds. Without the
+persistent worker (below), each module's compile starts a GHC and reads the
+interfaces of its imports, which `--make` does once per target, so a clean
+build takes several times as long. Rebuilds pay that cost only for the
+modules they compile, so they are mostly faster than with `--make` even
+without the worker.
+
+The persistent worker in `tools/ghc-worker` removes most of that cost by
+sending the compiles to a long-running process that keeps what it has
+read, so a module's imports are read once rather than once per module.
+With it, clean builds on the bench were as fast as with a `--make` per
+target or faster, and much faster where `--make` per target can't use all
+the cores, as in a chain of libraries that each depend on the one before.
+
+`per_module_worker` in the `[haskell]` section of the buckconfig says how
+to get the worker:
+
+- `local`: a worker defined in the project itself, which buck2 builds with
+  the project's GHC (e.g. add `buck2/tools/ghc-worker` to the packages of
+  `cabal.project` and use `cabal buck2`)
+- a path, or a name on `$PATH`: a worker built by some other means.
+- `none`, or unset: no worker.
+
+`per_module_worker_rts_options` in the same section sets the RTS options of
+the worker the targets share (`-A64m -n4m -qn8` by default, see the
+worker's README), `per_module_worker_sessions` the most sessions it
+keeps, which bounds its memory (see the worker's README),
+`per_module_worker_session_mode` how they
+compile (`auto`, the default, or `make` to turn off sharing interfaces
+between targets: see `toolchains/per_module_worker.bzl`), and
+`per_module_worker_build_tools` the build tools on its `PATH` (targets,
+separated by spaces). A target with a build tool that isn't among them is
+compiled without the worker, one `ghc -c` per module, so list the tools
+that many targets use (a test-discovery preprocessor, say).
 
 The recompilation check used by `per_module` is also currently slightly coarser
 than GHC's, in that GHC also looks at which definitions from a dependency are
@@ -87,6 +132,10 @@ own build. Update the submodule there to test a change here.
 Some of the rules also have tests of their own, which don't rely
 on cabal-buck2 or Hackage: `tests/rules/run.sh GHC_BIN_DIR`, with `buck2` on
 `PATH`. See [tests/rules/README.md](tests/rules/README.md).
+
+With Nix, `nix flake check -L` runs those and the persistent worker's tests
+(`tools/ghc-worker`) with each GHC the worker supports, in parallel, and
+`nix develop .#ghc9141` (say) gives a shell with that GHC and cabal.
 
 `template/` has the `.buckconfig` and `PACKAGE` that `cabal buck2` copies to a
 project that doesn't have them.

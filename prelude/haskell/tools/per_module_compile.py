@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # Compiles one module of a target compiled per module with `ghc -c`, then
-# writes the module's .abi file and buck2 dep file (see _compile_per_module
-# in prelude/haskell/compile.bzl):
+# writes the module's .abi file and buck2 dep file, from the request the
+# persistent worker would take for it (see tools/ghc-worker and
+# _compile_per_module in prelude/haskell/compile.bzl):
 #
-#   --depfile FILE --abi FILE --module Foo/Bar --outdir DIR --hisuf SUF
-#   [--ldtree DIRS] [--hidir=DIR]... [--mkdir=DIR]...
+#   --request --contract V --depfile FILE --abi FILE --module Foo/Bar
+#   --source FILE --outdir DIR --hisuf SUF [--boot] [--ldtree DIRS]
+#   [--link=MODULE]... [--hidir=DIR]... [--srcroot=DIR]... [--mkdir=DIR]...
 #   -- GHC SESSION_FLAGS... -- MODULE_FLAGS...
 #
 # The compile is GHC with the session's flags then the module's. The
 # session's flags are those the target's modules share (with the same
-# package dbs); the module's own are its source and outputs. A persistent
-# compiler could keep a session per set of session flags; here the two are
-# just joined again. The .abi file and the dep file come from the text of
-# the new interface, which the compile dumps itself (-ddump-hi: the same
-# text as --show-iface, which would cost a second GHC start per module).
-# See Note [Reading the interface text] in compile.bzl.
+# package dbs); the module's own are its source and outputs. The worker
+# keeps a session per set of session flags; here the two are just joined
+# again. The .abi file and the dep file come from the text of the new
+# interface, which the compile dumps itself (-ddump-hi: the same text as
+# --show-iface, which would cost a second GHC start per module). See Note
+# [Reading the interface text] in compile.bzl.
 
 import glob
 import os
@@ -78,7 +80,11 @@ def parse_args(args):
     i = 0
     while args[i] != "--":
         a = args[i]
-        if a in ("--depfile", "--abi", "--module", "--outdir", "--hisuf", "--ldtree"):
+        if a in ("--request", "--boot"):
+            i += 1
+        elif a in ("--contract", "--source"):
+            i += 2
+        elif a in ("--depfile", "--abi", "--module", "--outdir", "--hisuf", "--ldtree"):
             request[a[2:]] = args[i + 1]
             i += 2
         elif a.startswith("--hidir="):
@@ -86,6 +92,8 @@ def parse_args(args):
             i += 1
         elif a.startswith("--mkdir="):
             os.makedirs(a[len("--mkdir="):], exist_ok=True)
+            i += 1
+        elif a.startswith(("--srcroot=", "--link=")):
             i += 1
         else:
             print("per_module_compile.py: unexpected argument " + a, file=sys.stderr)

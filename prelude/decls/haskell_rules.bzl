@@ -62,6 +62,7 @@ haskell_binary = prelude_rule(
             "per_module": attrs.bool(default = False),  # as haskell_library's
             "_per_module_compile": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//haskell/tools:per_module_compile")),
             "_per_module_deps": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//haskell/tools:per_module_deps")),
+            "per_module_worker": attrs.option(attrs.exec_dep(providers = [WorkerInfo]), default = None),  # as haskell_library's
             "th_build_depends": attrs.option(attrs.list(attrs.dep()), default = None),  # as haskell_library's
             "linker_flags": attrs.list(attrs.arg(), default = []),
             "platform": attrs.option(attrs.string(), default = None),
@@ -195,6 +196,13 @@ haskell_library = prelude_rule(
             # The scripts of the per-module compiles.
             "_per_module_compile": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//haskell/tools:per_module_compile")),
             "_per_module_deps": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//haskell/tools:per_module_deps")),
+            # The persistent worker used for the per-module compiles, if the
+            # project builds it from source. This is a
+            # haskell_per_module_worker() (worker.bzl), which the targets
+            # then share. Each target names it because the toolchain can't
+            # (see Note [The persistent worker] in compile.bzl). buck2 uses
+            # it only when `[haskell] per_module_worker` is set.
+            "per_module_worker": attrs.option(attrs.exec_dep(providers = [WorkerInfo]), default = None),
             # With per_module: the dependencies, among this target's local
             # dependencies also compiled `per_module`, whose code its Template
             # Haskell splices and ANN pragmas run. Without it, all of them. A

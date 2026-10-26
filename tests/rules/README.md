@@ -17,6 +17,12 @@ to `WORK_DIR` (a new temporary directory by default), since the checks
 edit its sources, and built there; each buck2 command's output is saved under
 `WORK_DIR/project/buck-logs/`. It takes about 15 seconds.
 
+With `GHC_WORKER` set to a `ghc-worker` (`tools/ghc-worker`) built with the
+same GHC, the modules are compiled in it (`[haskell] per_module_worker`),
+and the same checks apply, with `check_workers` checking that they were,
+except those that need their target's environment. `nix flake check` at the top
+of the repository runs the tests both ways with each GHC.
+
 Each check prints `PASS`, `FAIL` (with the missing and unexpected members
 of the set it compared) or `SKIP` (the explicit level imports check,
 before GHC 9.14). The script fails on any `FAIL`.
@@ -59,6 +65,8 @@ before GHC 9.14). The script fails on any `FAIL`.
 | `//tie:tie` | two Template Haskell modules, each behind a boot file below the other, and one behind them |
 | `//rp:rp`, `//mk:mk` | `rp`'s flat sources (`Lib.hs`), one of which imports `Q.Lib` from `mk` (built with `--make`), whose interface path ends in `/Lib.hi` |
 | `//mv:hi`, `//mv:lo`, `//mv:main` | a module that moves from `hi` to `lo`, its dependency |
+| `//wk:wk` | with `GHC_WORKER`: a target that names its worker (`//wk:w`) |
+| `//bt:shared`, `//bt:own` | a module run through a preprocessor (`-pgmF`), a build tool: `bt-shared`, which the project's buckconfig puts on the worker's `PATH`, and `bt-own`, which it doesn't |
 | `//idx:idx` | built with `-fwrite-ide-info`, for its index (`index.bxl` prints it) |
 | `//hdr:hdr` | a module that `#include`s a header in the target's `srcs` (`Hdr/value.h`) |
 | `//tf:tf` | a splice without a LANGUAGE pragma, for Template Haskell enabled by the toolchain's flags |
