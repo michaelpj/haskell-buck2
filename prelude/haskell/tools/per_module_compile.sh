@@ -1,10 +1,12 @@
 #!/bin/sh
 # Compiles one module of a target compiled per module with `ghc -c`, then
-# writes the module's .abi file and buck2 dep file (see _compile_per_module
-# in prelude/haskell/compile.bzl):
+# writes the module's .abi file and buck2 dep file, from the request the
+# persistent worker would take for it (see tools/ghc-worker and
+# _compile_per_module in prelude/haskell/compile.bzl):
 #
-#   --depfile FILE --abi FILE --module Foo/Bar --outdir DIR --hisuf SUF
-#   [--ldtree DIRS] [--hidir=DIR]... [--mkdir=DIR]...
+#   --request --contract V --depfile FILE --abi FILE --module Foo/Bar
+#   --source FILE --outdir DIR --hisuf SUF [--boot] [--ldtree DIRS]
+#   [--hidir=DIR]... [--srcroot=DIR]... [--mkdir=DIR]...
 #   -- GHC SESSION_FLAGS... -- MODULE_FLAGS...
 #
 # The compile is GHC with the session's flags then the module's. The .abi
@@ -15,6 +17,8 @@
 hidirs=""
 while [ "$1" != "--" ]; do
   case "$1" in
+    --request | --boot) shift ;;
+    --contract | --source) shift 2 ;;
     --depfile) depfile=$2; shift 2 ;;
     --abi) abi=$2; shift 2 ;;
     --module) self=$2; shift 2 ;;
@@ -22,6 +26,7 @@ while [ "$1" != "--" ]; do
     --hisuf) hisuf=$2; shift 2 ;;
     --ldtree) export LD_LIBRARY_PATH="$2"; shift 2 ;;
     --hidir=*) hidirs="$hidirs ${1#--hidir=}"; shift ;;
+    --srcroot=*) shift ;;
     --mkdir=*) mkdir -p "${1#--mkdir=}"; shift ;;
     *) echo "per_module_compile.sh: unexpected argument $1" >&2; exit 2 ;;
   esac

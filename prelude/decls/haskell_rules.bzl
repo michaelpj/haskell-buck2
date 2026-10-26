@@ -62,6 +62,7 @@ haskell_binary = prelude_rule(
             "per_module": attrs.bool(default = False),  # as haskell_library's
             "_per_module_compile": attrs.default_only(attrs.source(default = "prelude//haskell/tools:per_module_compile.sh")),
             "_per_module_deps": attrs.default_only(attrs.source(default = "prelude//haskell/tools:per_module_deps.sh")),
+            "per_module_worker": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),  # as haskell_library's
             "linker_flags": attrs.list(attrs.arg(), default = []),
             "platform": attrs.option(attrs.string(), default = None),
         }
@@ -196,6 +197,11 @@ haskell_library = prelude_rule(
             # The scripts of the per-module compiles.
             "_per_module_compile": attrs.default_only(attrs.source(default = "prelude//haskell/tools:per_module_compile.sh")),
             "_per_module_deps": attrs.default_only(attrs.source(default = "prelude//haskell/tools:per_module_deps.sh")),
+            # The persistent worker of the per-module compiles, when the
+            # project builds it from source (tools/ghc-worker). The toolchain
+            # can't depend on a target the project builds, so each per-module
+            # target names it. None: the toolchain's, if it has one.
+            "per_module_worker": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             # Libraries that are part of this one, as the C of a Cabal package
             # is part of its library: their objects are in its archive, and
             # linked into its shared library, and what depends on it isn't

@@ -1,0 +1,56 @@
+cabal-version:      3.0
+name:               ghc-worker
+version:            0.1.0.0
+synopsis:           A buck2 persistent worker that compiles a package's modules in one GHC session
+description:
+  See README.md. One worker per target compiled per module: buck2 sends it one
+  request per module to compile, and each is compiled on arrival, concurrently,
+  with GHC's own per-module compile in a session kept between them (interfaces,
+  loaded libraries), as `ghc --make -j` does for a package. It writes each
+  module's ABI hash and buck2 dep file from the interface GHC produced, so the
+  rules need not read the interface text.
+license:            MIT
+build-type:         Simple
+tested-with:        GHC==9.14.1, GHC==9.12.4, GHC==9.10.3, GHC==9.8.4, GHC==9.6.7
+
+executable ghc-worker
+  main-is:          Main.hs
+  other-modules:    Grpc, Proto, Session
+  hs-source-dirs:   src
+  default-language: GHC2021
+  ghc-options:      -Wall -threaded -dynamic -rtsopts "-with-rtsopts=-N -A64m"
+  build-depends:
+    , base
+    , bytestring
+    , containers
+    , directory
+    , filepath
+    , ghc >= 9.6 && < 9.15
+    , http2 >= 5
+    , http-semantics
+    , http-types
+    , network
+    , process, unix
+    , stm
+    , time
+
+-- Compiles a small package through the built worker, in both of its modes.
+test-suite spec
+  type:             exitcode-stdio-1.0
+  main-is:          Main.hs
+  hs-source-dirs:   test, src
+  other-modules:    Proto
+  default-language: GHC2021
+  ghc-options:      -Wall -threaded
+  build-tool-depends: ghc-worker:ghc-worker
+  build-depends:
+    , base
+    , bytestring
+    , directory
+    , filepath
+    , http2 >= 5
+    , http-semantics
+    , http-types
+    , network
+    , process
+    , unix

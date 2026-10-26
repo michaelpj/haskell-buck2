@@ -59,6 +59,20 @@ allocation area, `compiler_flags = +RTS -A64m -RTS` in the `[haskell]`
 section of the buckconfig (see below), which took 13% off the per-module
 compiles of one project.
 
+The persistent worker in `tools/ghc-worker` takes away much of that CPU cost:
+buck2 sends the compiles of a target to one long-running process, which
+compiles them in a single GHC session and so reads each interface once.
+`per_module_worker` in the `[haskell]` section of the buckconfig says
+which to use:
+
+- `local`: the project's own, which buck2 builds with the project's GHC
+  (add `buck2/tools/ghc-worker` to the packages of `cabal.project`);
+- a path, or a name on `$PATH`: one installed with the project's GHC (see
+  `tools/ghc-worker/README.md`);
+- `none`, or unset: no worker.
+
+The worker is used when buck2 runs the compiles locally.
+
 # Compiler and linker flags from the environment
 
 buck2 runs every build action with a clean environment, so directories that

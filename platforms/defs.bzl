@@ -7,16 +7,26 @@
 # stays correct even if that vendored rule's own executor_config logic
 # ever changes.
 load("@prelude//cfg/exec_platform:marker.bzl", "get_exec_platform_marker")
+load("@toolchains//:per_module_worker.bzl", "has_per_module_worker")
 
 # Actions run locally, and their results are looked up in, and uploaded to, a
 # remote action cache (the one `[buck2_re_client]` in .buckconfig points to).
 # Nothing runs remotely.
-def _cache_executor_config():
+def _cache_executor_config(persistent_workers):
     return CommandExecutorConfig(
         local_enabled = True,
         remote_enabled = False,
         remote_cache_enabled = True,
         allow_cache_uploads = True,
+        use_persistent_workers = persistent_workers,
+    )
+
+# As the base platform's (local, no remote cache), with persistent workers.
+def _worker_executor_config():
+    return CommandExecutorConfig(
+        local_enabled = True,
+        remote_enabled = False,
+        use_persistent_workers = True,
     )
 
 def _execution_platform_with_constraints_impl(ctx: AnalysisContext) -> list[Provider]:
@@ -31,7 +41,7 @@ def _execution_platform_with_constraints_impl(ctx: AnalysisContext) -> list[Prov
     platform = ExecutionPlatformInfo(
         label = name,
         configuration = cfg,
-        executor_config = _cache_executor_config() if ctx.attrs.cache else base.executor_config,
+        executor_config = _cache_executor_config(ctx.attrs.persistent_workers) if ctx.attrs.cache else (_worker_executor_config() if ctx.attrs.persistent_workers else base.executor_config),
     )
 
     return [
@@ -52,6 +62,9 @@ execution_platform_with_constraints = rule(
         # `[cabal_buck2] cache = true` in .buckconfig, which `cabal buck2
         # --cache=ADDRESS` writes together with the remote cache's address.
         "cache": attrs.bool(default = read_root_config("cabal_buck2", "cache", "false") == "true"),
+        # Actions may run in persistent workers: the per-module compiles do
+        # when there is one (see toolchains/per_module_worker.bzl).
+        "persistent_workers": attrs.bool(default = has_per_module_worker()),
     },
 )
 

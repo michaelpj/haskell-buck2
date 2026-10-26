@@ -20,6 +20,7 @@ def _haskell_toolchain_impl(ctx):
             compile_env = ctx.attrs.compile_env,
             link_env = ctx.attrs.link_env,
             dynamic_ghc = ctx.attrs.dynamic_ghc,
+            per_module_worker = _tool(ctx.attrs.per_module_worker) if ctx.attrs.per_module_worker != None else None,
         ),
         HaskellPlatformInfo(name = host_info().arch),
     ]
@@ -45,6 +46,8 @@ haskell_toolchain = rule(
         # haskell/haskell.bzl's own uses of `haskell_toolchain.
         # dynamic_ghc` for what it actually gates.
         "dynamic_ghc": attrs.bool(default = True),
+        # See HaskellToolchainInfo.
+        "per_module_worker": attrs.option(attrs.one_of(attrs.exec_dep(providers = [RunInfo]), attrs.string()), default = None),
     },
     is_toolchain_rule = True,
 )

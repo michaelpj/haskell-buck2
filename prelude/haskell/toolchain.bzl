@@ -22,6 +22,9 @@ HaskellToolchainInfo = provider(
         # (not shell-evaluated).
         "link_env": provider_field(typing.Any, default = {}),
         "dynamic_ghc": provider_field(bool, default = True),
+        # The persistent worker of the per-module compiles (tools/ghc-worker
+        # in this repo), as a tool, or None to run one `ghc -c` per module.
+        "per_module_worker": provider_field(typing.Any, default = None),
         "linker": provider_field(typing.Any, default = None),
         "linker_flags": provider_field(typing.Any, default = None),
         "haddock": provider_field(typing.Any, default = None),

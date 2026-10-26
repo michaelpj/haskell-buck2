@@ -74,6 +74,7 @@
 # a tools.bzl from an earlier release fails here, on a symbol that says what
 # it is about, and an incompatible one is reported just below.
 load("@third-party-haskell//:tools.bzl", TOOLS_CABAL_BUCK2_VERSION = "CABAL_BUCK2_VERSION")
+load("@toolchains//:per_module_worker.bzl", "project_per_module_worker")
 load("//buck2:version.bzl", "CABAL_BUCK2_VERSION")
 load("//buck2:cmm.bzl", "cmm_library")
 load("//buck2:cxx.bzl", "cxx_binary", "cxx_library")
@@ -576,6 +577,12 @@ def cabal_targets(spec, defaults = {}, overrides = {}, transform = None, rules =
             kwargs = transform(kind, c, kwargs)
             if kwargs == None:
                 continue
+        # The worker of the per-module compiles, when it is the project's own
+        # (`per_module_worker = local`, see buck2/toolchains/
+        # per_module_worker.bzl): every per-module target (however it came to
+        # be one) but the worker's own.
+        if kwargs.get("per_module", False) and "per_module_worker" not in kwargs and project_per_module_worker() != None and spec["package"]["name"] != "ghc-worker":
+            kwargs["per_module_worker"] = project_per_module_worker()
         _check_provided(spec, c, kwargs.get("srcs", {}))
         rules.get(kind, _DEFAULT_RULES[kind])(**kwargs)
     _data_files(spec, pkg_dir)

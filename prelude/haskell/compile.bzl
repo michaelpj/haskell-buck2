@@ -420,7 +420,8 @@ def compile(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool,
 # Per-module compilation (`per_module = True`): one `ghc -c` action per module
 # instead of one `ghc --make` per target. See Note [Per-module compilation],
 # Note [Early cut-off by dep files], Note [Compiling against dependencies
-# module by module] and Note [Template Haskell modules].
+# module by module], Note [Template Haskell modules] and Note [The
+# persistent worker].
 
 # The suffix of the srcs entry of a module's .hs-boot, and of its outputs.
 _BOOT = "-boot"
@@ -571,6 +572,12 @@ def _read_splices(text: str, nodes: list):
             th[n] = True
     return th
 
+# The version of the worker's request and of what it writes back (see
+# tools/ghc-worker and the per-module compile script, which take the same
+# request): the worker refuses a request of another version. Bump it, and
+# the worker's, when either changes.
+_WORKER_CONTRACT = "2"
+
 def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool, pkgname: str | None, native_shared_libs_dir: [Artifact, None], dynamic_too: bool) -> CompileResultInfo:
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
     suffix = get_artifact_suffix(link_style, enable_profiling)
@@ -583,8 +590,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     tag = ctx.actions.artifact_tag()
 
     # The package flags of a module that runs Template Haskell: the final dbs
-    # of every dependency, libraries included; and of any other module: the
-    # early dbs, without
+    # of every dependency, libraries included (see Note [Libraries of the
+    # early package dbs]); and of any other module: the early dbs, without
     # the interface dirs or libraries of the dependencies compiled per module
     # (declared per module below).
     def packages(info):
@@ -604,6 +611,18 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
     base_cmd = cmd_args(haskell_toolchain.compiler, cmd_flags, file_flags)
     env = _ghc_env(ctx, prefix + "build-tool-depends")
 
+    # The persistent worker, if there is one: see Note [The persistent
+    # worker]. The target's own (one the project builds) comes before the
+    # toolchain's.
+    worker_info = None
+    worker = ctx.attrs.per_module_worker[RunInfo] if getattr(ctx.attrs, "per_module_worker", None) != None else haskell_toolchain.per_module_worker
+    if worker != None:
+        worker_cmd = _in_env(env, cmd_args(worker))
+        worker_info = WorkerInfo(
+            exe = worker_cmd,
+            env = {"LD_LIBRARY_PATH": cmd_args(native_shared_libs_dir, ignore_artifacts = True)} if native_shared_libs_dir != None else {},
+        )
+
     # The nodes of the graph: the modules, and their boot files as
     # "<module>-boot" (named so in a srcs dict; in a list they only have the
     # module's name).
@@ -614,6 +633,18 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
         elif src.short_path.endswith(_BOOT):
             nodes.append((name if _is_boot(name) else name + _BOOT, src))
     src_of = {n: src for n, src in nodes}
+
+    # The tree of the target's sources, the worker's import path (see Note
+    # [The persistent worker]). Tagged: the tree changes with any source of
+    # the target, which is no reason to compile the others again (a
+    # module's own source is an input in its own right).
+    src_tree = None
+    if worker_info != None:
+        src_tree = ctx.actions.symlinked_dir(
+            prefix + "srcs",
+            {_node_file(n, "hs"): src for n, src in nodes},
+            has_content_based_path = False,
+        )
 
     # The outputs, all in one directory (so not at content-based paths),
     # which is the import path of every module's compile here and, through
@@ -755,7 +786,8 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
             stubdir = ctx.actions.declare_output(prefix + "stubs/" + n, dir = True, has_content_based_path = False)
             module_flags = cmd_args("-c", src_of[n], "-o", outputs[o_of[n]].as_output(), "-ohi", outputs[hi_of[n]].as_output(), "-stubdir", stubdir.as_output())
             mkdirs = [stubdir.as_output()]
-            module_flags.add("-ddump-hi", "-ddump-to-file", cmd_args(outputs[abi_of[n]].as_output(), format = "-ddump-file-prefix={}"))
+            if worker_info == None:
+                module_flags.add("-ddump-hi", "-ddump-to-file", cmd_args(outputs[abi_of[n]].as_output(), format = "-ddump-file-prefix={}"))
             if closure[n]:
                 module_flags.add(tag.tag_artifacts(cmd_args(_dir_of(outputs[hi_of[closure[n][0]]], closure[n][0], hisuf), hidden = closure_files, format = "-i{}")))
             if upstream_files:
@@ -767,24 +799,32 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
                 module_flags.add("-hiedir", hiedir.as_output())
                 mkdirs.append(hiedir.as_output())
 
-            # The compile script's request (see the script).
+            # The request, which the worker takes, and the compile script
+            # without it: see Note [The persistent worker].
             depfile = ctx.actions.declare_output(prefix + "dep/" + n + ".dep", has_content_based_path = False)
             request = cmd_args(
+                "--request",
+                "--contract",
+                _WORKER_CONTRACT,
                 "--depfile",
                 tag.tag_artifacts(depfile.as_output()),
                 "--abi",
                 outputs[abi_of[n]].as_output(),
                 "--module",
                 _module_of(n).replace(".", "/"),
+                "--source",
+                src_of[n],
                 "--outdir",
                 _dir_of(outputs[hi_of[n]].as_output(), n, hisuf),
                 "--hisuf",
                 hisuf,
+                "--boot" if _is_boot(n) else [],
                 ["--ldtree", ld_tree] if ld_tree != None else [],
                 # The script only needs their paths; as inputs they are
                 # dep-file governed like everything else the module may
                 # read.
                 tag.tag_artifacts(cmd_args(hidirs, format = "--hidir={}")),
+                tag.tag_artifacts(cmd_args(src_tree, format = "--srcroot={}")) if src_tree != None else [],
                 cmd_args(mkdirs, format = "--mkdir={}"),
                 "--",
                 base_cmd,
@@ -792,14 +832,16 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
                 "--",
                 module_flags,
             )
+            run = {"exe": WorkerRunInfo(worker = worker_info, exe = worker_cmd)} if worker_info != None else {}
             ctx.actions.run(
-                _in_env(env, cmd_args("sh", ctx.attrs._per_module_compile, request)),
+                request if worker_info != None else _in_env(env, cmd_args("sh", ctx.attrs._per_module_compile, request)),
                 category = "haskell_compile_module_" + suffix.replace("-", "_"),
                 identifier = n,
                 # So that ghc can skip the compile when the interface it
                 # would write is unchanged, as in --make mode (see compile()).
                 no_outputs_cleanup = True,
                 dep_files = {"hs": tag},
+                **run
             )
 
         obj_map = {}
@@ -873,7 +915,9 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # text]): for each import, the imported module's .abi file, and each object
 # and library that a Template Haskell splice loaded, which GHC records as
 # dependent files. The .abi file holds the interface's ABI hash; each action
-# writes it next to the interface. Listing the interface itself would
+# writes it next to the interface. The compile script
+# (tools/per_module_compile.sh) writes both from the interface's text, the
+# persistent worker from the interface. Listing the interface itself would
 # recompile every importer after a comment-only edit, since its bytes
 # include the hash of the source.
 #
@@ -912,13 +956,45 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # LD_LIBRARY_PATH, so it waits for all of them to be linked, as a --make
 # compile does. The tree is given to these modules' compiles alone, as a
 # tagged input, so that a relink re-runs only the modules whose dep files
-# list it.
+# list it. The other modules compile against the early dbs, which name no
+# library: see Note [Libraries of the early package dbs].
 #
 # Which modules run Template Haskell is decided before any compile, from
 # the target's flags and from the sources: the deps script
 # (tools/per_module_deps.sh) looks for the extensions' names and for ANN
 # pragmas. It can find too much (a name in a comment), which only makes a
 # module wait for more.
+
+# Note [The persistent worker]
+#
+# What remains of the per-module build's cost over --make is a GHC process
+# per module, each reading the interfaces of its imports again. A buck2
+# persistent worker (tools/ghc-worker) takes that away: buck2 sends the
+# compiles of a target (and way) to one process, which compiles each as it
+# arrives, concurrently, in a GHC session that keeps what it has read.
+#
+# A module's action is the same request with or without a worker: the
+# worker takes it, and without one the compile script runs it as one
+# `ghc -c`. When buck2 runs an action without the worker, as it may, it
+# runs the worker program, which compiles the one module and exits. The
+# request carries the module's source and its compile's flags in two parts,
+# those of the module's session and the module's own. The worker keeps a
+# session per set of session flags (a Template Haskell module's package
+# dbs differ from the others', see Note [Template Haskell modules]), and
+# ignores the module's own flags but for -hiedir. _WORKER_CONTRACT names
+# the version of the request, which a worker installed for other rules
+# refuses.
+#
+# The worker gets the environment of a compile when it starts, before the
+# libraries are linked, so the shared library trees go in it by path only:
+# starting it waits for no link, and a Template Haskell module's action
+# materialises its trees before it is dispatched. Its session finds the
+# modules a compile imports by name, on an import path: a tree of the
+# target's sources alone, since in the project's source directories a
+# module of another target (a sublibrary's, say) would be found before that
+# target's package. The worker has no concurrency limit of its own: buck2's
+# -j bounds the actions in workers with the rest, and a lower limit per
+# worker would only hold a target's modules back.
 
 # Note [Reading the interface text]
 #
@@ -938,3 +1014,23 @@ def _compile_per_module(ctx: AnalysisContext, link_style: LinkStyle, enable_prof
 # way it builds its other tools; the Stack project's hi-file-parser library
 # reads the same fields without the GHC API, by following the format by hand
 # per release.
+
+# Note [Libraries of the early package dbs]
+#
+# A module that runs Template Haskell (or evaluates an ANN pragma) runs code
+# in GHC's interpreter, which first loads the library of every package
+# exposed on the command line and of their dependencies (GHC's "preload"
+# units), whether or not the splice uses it. A dynamically linked GHC
+# tolerates a package whose library file isn't there: it warns, or says
+# nothing, and carries on. But a library that is there and was linked
+# against one that isn't fails to load in the system's dynamic linker, and
+# the compile with it. buck2 doesn't sandbox local actions, so files a
+# compile doesn't declare as inputs may or may not be on disk: a library
+# not yet linked, or not materialised, beside one that is.
+#
+# So a package db either names a library that the compile depends on, or
+# none. The early dbs name none: they are what a module compiles against
+# before its dependencies are linked. A module that runs Template Haskell
+# compiles against the final dbs of the packages whose libraries it
+# depends on, here all of them; every other module against the early dbs,
+# and never starts the interpreter.

@@ -448,7 +448,8 @@ def _make_package(
     # library, its import directory the one the modules' interfaces are
     # written to one by one (see compile.bzl). Registered with nothing built,
     # against the dependencies' early dbs, so --force: ghc-pkg would refuse
-    # a package whose interfaces don't exist yet.
+    # a package whose interfaces don't exist yet. It names no library on
+    # purpose: see Note [Libraries of the early package dbs] in compile.bzl.
     early: bool = False,
 ) -> Artifact:
     artifact_suffix = get_artifact_suffix(link_style, enable_profiling)
@@ -473,10 +474,9 @@ def _make_package(
         # has one import directory. A profiled package's other interfaces,
         # which Template Haskell reads, are in its full db.
         import_dirs = ['"${pkgroot}/' + per_module_dir(hi_link_style, enable_profiling) + 'out"']
-        library_dirs = []
     else:
         import_dirs = [mk_artifact_dir("hi", profiled, hi_link_style) for profiled in hi.keys()]
-        library_dirs = [mk_artifact_dir("lib", profiled) for profiled in hi.keys()]
+    library_dirs = [] if early else [mk_artifact_dir("lib", profiled) for profiled in hi.keys()]
 
     # Reexports are named by the unit they come from, which GHC finds in the
     # package databases whether or not the unit is exposed.
