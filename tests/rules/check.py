@@ -641,6 +641,25 @@ def check_cutoff_comment(st):
     expect_set("modules compiled after a comment-only edit to A.Base", ran, {"lib:A.Base"})
 
 
+# The categories of library and executable links.
+LINK = re.compile(r"link|archive")
+
+
+def check_check_subtarget(st):
+    """After an edit to A.Base's code that leaves its ABI alone, main[check]
+    compiles A.Base but links nothing; a build of main then links lib and
+    main."""
+    replace("lib/A/Base.hs", "base = 1", "base = 0 + 1")
+    build("//main:main[check]")
+    actions = what_ran()
+    expect_set("modules compiled for main[check]", compiled_modules(actions), {"lib:A.Base"})
+    links = {(target_name(t), c) for t, c, _, _ in actions if LINK.search(c)}
+    expect_set("links run for main[check]", links, set())
+    build("//main:main")
+    links = {target_name(t) for t, c, _, _ in what_ran() if LINK.search(c)}
+    expect("main and lib linked after main[check] (linked: {})".format(sorted(links)), {"lib", "main"} <= links)
+
+
 def check_cutoff_abi_base(st):
     """A new export of A.Base recompiles the modules whose dep files list
     A.Base's ABI, within and across packages, reexport-user's U.M among them,
@@ -804,6 +823,7 @@ CHECKS = [
     check_native_libraries_for_splices,
     check_configurations,
     check_cutoff_comment,
+    check_check_subtarget,
     check_cutoff_abi_base,
     check_cutoff_abi_mid,
     check_th_body_change,

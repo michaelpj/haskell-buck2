@@ -25,6 +25,11 @@ buck2 build my-package:my-program -m opt
 
 There are other build options that can be selected in a similar way, such as `-m prof` to enable profiling. See `constraints/BUCK` for details.
 
+# Checking without linking
+
+`buck2 build my-package:my-program[check]` compiles a target without linking
+it, which is enough to see its type errors. 
+
 # Per-module compilation (experimental)
 
 By default each `haskell_library()`/`haskell_binary()` is compiled by one
@@ -113,6 +118,12 @@ The same section has options for the worker that the targets share:
 The recompilation check used by `per_module` is also currently slightly coarser
 than GHC's, in that GHC also looks at which definitions from a dependency are
 used by a module. We don't do this currently but we could do in future.
+
+With `per_module`, `[check]` (above) doesn't link the target's dependencies
+either, since a module's compile needs only its imports' interfaces. A module
+with Template Haskell still waits for the libraries whose code its splices
+run: all of the target's local dependencies, unless `th_build_depends` or
+explicit level imports say which.
 
 # Compiler and linker flags from the environment
 
