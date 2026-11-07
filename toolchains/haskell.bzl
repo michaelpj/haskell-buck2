@@ -29,6 +29,8 @@ def _haskell_toolchain_impl(ctx):
             linker_flags = ctx.attrs.linker_flags,
             compile_env = ctx.attrs.compile_env,
             link_env = ctx.attrs.link_env,
+            allow_cache_upload = ctx.attrs.allow_cache_upload,
+            allow_dep_file_cache_upload = ctx.attrs.allow_dep_file_cache_upload,
             dynamic_ghc = ctx.attrs.dynamic_ghc,
             # Made once, here, so that every target gets the same worker.
             per_module_shared_worker = per_module_worker_info(worker, ctx.attrs.compile_env, ctx.attrs.per_module_worker_rts_options, sessions, session_mode, tools_dir) if worker != None else None,
@@ -56,11 +58,13 @@ haskell_toolchain = rule(
         "linker_flags": attrs.list(attrs.string(), default = []),
         "compile_env": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "link_env": attrs.dict(attrs.string(), attrs.string(), default = {}),
-        # Whether the `compiler` above is itself dynamically linked -
-        # see buck2/gen-haskell-prebuilt.py's own `_ghc_dynamic()` for
-        # how this gets discovered (not assumed), and buck2/prelude/
-        # haskell/haskell.bzl's own uses of `haskell_toolchain.
-        # dynamic_ghc` for what it actually gates.
+        # See HaskellToolchainInfo.
+        "allow_cache_upload": attrs.bool(default = False),
+        "allow_dep_file_cache_upload": attrs.bool(default = False),
+        # Whether the `compiler` above is itself dynamically linked.
+        # We need to know this because it affects how Template Haskell
+        # code needs to be compiled. It can be found by running `ghc
+        # --info`: look for the "GHC Dynamic" value.
         "dynamic_ghc": attrs.bool(default = True),
         # See HaskellToolchainInfo.
         "per_module_worker": attrs.option(attrs.one_of(attrs.exec_dep(providers = [RunInfo]), attrs.string()), default = None),

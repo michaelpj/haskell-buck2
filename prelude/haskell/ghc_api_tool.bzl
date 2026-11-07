@@ -15,6 +15,7 @@ def _haskell_ghc_api_tool_impl(ctx: AnalysisContext) -> list[Provider]:
     ctx.actions.run(
         in_compile_env(env_script, [], cmd_args("sh", "-c", 'out="$1"; shift; "$@" --print-libdir > "$out"', "sh", libdir.as_output(), haskell_toolchain.compiler)),
         category = "haskell_ghc_api_tool_libdir",
+        allow_cache_upload = haskell_toolchain.allow_cache_upload,
     )
 
     exe = ctx.actions.declare_output(ctx.attrs.name)
@@ -39,6 +40,7 @@ def _haskell_ghc_api_tool_impl(ctx: AnalysisContext) -> list[Provider]:
             exe.as_output(),
         )),
         category = "haskell_ghc_api_tool",
+        allow_cache_upload = haskell_toolchain.allow_cache_upload,
     )
     return [DefaultInfo(default_output = exe), RunInfo(args = cmd_args(exe))]
 

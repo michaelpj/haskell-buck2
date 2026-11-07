@@ -12,17 +12,18 @@ load("@toolchains//:per_module_worker.bzl", "has_per_module_worker")
 # Without a cache or persistent workers, the base platform's executor
 # config. With either, actions run locally (nothing runs remotely), and:
 #
-# - with `cache`, their results are looked up in, and uploaded to, a remote
-#   action cache (the one `[buck2_re_client]` in .buckconfig points to);
+# - with `cache`, their results are looked up in a remote action cache (the
+#   one `[buck2_re_client]` in .buckconfig points to) and, with `uploads`,
+#   uploaded to it: those of the actions that allow it;
 # - with `persistent_workers`, an action may run in a persistent worker.
-def _executor_config(base: ExecutionPlatformInfo, cache: bool, persistent_workers: bool):
+def _executor_config(base: ExecutionPlatformInfo, cache: bool, uploads: bool, persistent_workers: bool):
     if not cache and not persistent_workers:
         return base.executor_config
     return CommandExecutorConfig(
         local_enabled = True,
         remote_enabled = False,
         remote_cache_enabled = cache,
-        allow_cache_uploads = cache,
+        allow_cache_uploads = cache and uploads,
         use_persistent_workers = persistent_workers,
     )
 
@@ -38,7 +39,7 @@ def _execution_platform_with_constraints_impl(ctx: AnalysisContext) -> list[Prov
     platform = ExecutionPlatformInfo(
         label = name,
         configuration = cfg,
-        executor_config = _executor_config(base, ctx.attrs.cache, ctx.attrs.persistent_workers),
+        executor_config = _executor_config(base, ctx.attrs.cache, ctx.attrs.cache_uploads, ctx.attrs.persistent_workers),
     )
 
     return [
@@ -62,6 +63,10 @@ execution_platform_with_constraints = rule(
         # Actions may run in persistent workers: the per-module compiles do
         # when there is one (see toolchains/per_module_worker.bzl).
         "persistent_workers": attrs.bool(default = has_per_module_worker()),
+        # `[cabal_buck2] cache_uploads = false` looks results up in the cache
+        # without uploading any, on a machine that shouldn't write to a shared
+        # cache, say.
+        "cache_uploads": attrs.bool(default = read_root_config("cabal_buck2", "cache_uploads", "true") == "true"),
     },
 )
 

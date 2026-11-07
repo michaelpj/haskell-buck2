@@ -30,11 +30,16 @@ per_module_worker`). The same checks apply, and `check_workers` checks that
 the modules were compiled in the worker, except those that need their
 target's environment. `nix flake check` runs the tests both ways.
 
+With `BAZEL_REMOTE` set to a `bazel-remote` binary, `check_cache` runs one
+as a remote cache, and checks that the rules' actions upload their results
+and that a clean build finds them there. The dev shells and `nix flake
+check` set it.
+
 Each check prints `PASS` or `FAIL` (with the missing and unexpected members
 of the set it compared) or `SKIP` (the explicit level imports check,
-before GHC 9.14). The script fails on any `FAIL`. One check is of a
-mistake in `th_build_depends`: it checks that the compile fails, saying
-what to do instead.
+before GHC 9.14, and `check_cache` without `BAZEL_REMOTE`). The script fails
+on any `FAIL`. One check is of a mistake in `th_build_depends`: it checks
+that the compile fails, saying what to do instead.
 
 ## How it works
 

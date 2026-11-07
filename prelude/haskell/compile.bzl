@@ -347,6 +347,10 @@ def in_env(env, cmd: cmd_args) -> cmd_args:
 def has_modules(ctx: AnalysisContext) -> bool:
     return any([is_haskell_src(src) for _, src in srcs_to_pairs(ctx.attrs.srcs)])
 
+# The environment variables that say where the rule's data files are.
+def data_dirs_env(ctx: AnalysisContext) -> dict[str, Artifact]:
+    return {name: dep[DefaultInfo].default_outputs[0] for name, dep in ctx.attrs.data_dirs.items()}
+
 # Compile all the context's sources with `ghc --make`.
 #
 # `dynamic_from`, for a profiled compile, is the non-profiled compile of the
@@ -399,6 +403,7 @@ def compile(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool,
     ctx.actions.run(
         in_env(ghc_env(ctx, artifact_suffix + "-build-tool-depends"), compile_cmd),
         category = "haskell_compile_" + artifact_suffix.replace("-", "_"),
+        allow_cache_upload = haskell_toolchain.allow_cache_upload,
         # Keep the previous run's -odir/-hidir so that `ghc --make` can do its
         # own recompilation checking and only rebuild the modules whose
         # sources or imported interfaces changed, rather than the whole
@@ -406,7 +411,7 @@ def compile(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool,
         # timestamps, so this is safe even though Buck doesn't preserve
         # timestamps on artifacts.
         no_outputs_cleanup = True,
-        env = {"LD_LIBRARY_PATH": cmd_args(native_shared_libs_dir)} if native_shared_libs_dir != None else {},
+        env = data_dirs_env(ctx) | ({"LD_LIBRARY_PATH": cmd_args(native_shared_libs_dir)} if native_shared_libs_dir != None else {}),
     )
 
     return args.result
